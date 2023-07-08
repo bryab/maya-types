@@ -18,7 +18,7 @@ enum FuncMode {
 }
 
 /// Convert a MEL type to a Python type, accounting for tuples as well.
-fn mel_tuple_type_to_py(type_name: &str) -> String {
+fn py_type_from_maya(type_name: &str) -> String {
     lazy_static! {
         static ref RE_ARRAY: Regex = Regex::new(r"(\w+)\[\]").unwrap();
         static ref RE_TUPLE_TYPED: Regex = Regex::new(r"(\w+)\[(\d)\]").unwrap();
@@ -31,7 +31,7 @@ fn mel_tuple_type_to_py(type_name: &str) -> String {
             .get(1)
             .unwrap()
             .as_str();
-        format!("list[{}]", mel_type_to_py(type_name))
+        format!("list[{}]", py_type_from_maya_simple(type_name))
     } else if RE_TUPLE_TYPED.is_match(type_name) {
         let (_, type_name, tuple_length) = RE_TUPLE_TYPED
             .captures(&type_name)
@@ -41,7 +41,7 @@ fn mel_tuple_type_to_py(type_name: &str) -> String {
             .next_tuple()
             .unwrap();
 
-        let type_name = mel_type_to_py(&type_name);
+        let type_name = py_type_from_maya_simple(&type_name);
         let tuple_length = tuple_length.parse::<usize>().unwrap();
 
         format!(
@@ -61,16 +61,16 @@ fn mel_tuple_type_to_py(type_name: &str) -> String {
                     panic!("Empty type produced from: {}", type_name);
                 }
             })
-            .map(|s| mel_type_to_py(s).to_string())
+            .map(|s| py_type_from_maya_simple(s).to_string())
             .collect();
 
         format!("Tuple[{}]", type_names.join(", "))
     } else {
-        String::from(mel_type_to_py(type_name))
+        String::from(py_type_from_maya_simple(type_name))
     }
 }
 /// Just a simple mapping from types found in the Maya docs to native Python types
-fn mel_type_to_py(type_name: &str) -> &str {
+fn py_type_from_maya_simple(type_name: &str) -> &str {
     if type_name.is_empty() {
         panic!("Type name empty!");
     }
@@ -87,6 +87,32 @@ fn mel_type_to_py(type_name: &str) -> &str {
             "Any"
         }
     }
+}
+
+/// Some query flags don't specify the return type in a way that is easy to parse.
+/// Here I attempt to deduce the type from the name of the parameter
+fn py_type_from_flag_name(name: &str) -> Option<&str> {
+    let type_name = match name {
+        "boundingBox" => "Tuple[float,float,float,float,float,float]",
+        _ => return None,
+    };
+    Some(type_name)
+}
+
+/// In order to handle optional flags in functions, we must provide the default value for each flag.
+/// Unfortunately this is not known from the documentation.  The standard producedure here in Python
+/// Maybe to just make the default `None`, but this does not make sense as these parameters do not accept
+/// None as an argument.  As a workaround we must provide a valid default value for each type.
+fn default_value_for_type(pytype: &str) -> Option<&str> {
+    // FIXME: Need to handle tuples and lists
+    let value_str = match pytype {
+        "int" => "0",
+        "float" => "0.0",
+        "Text" => "\"\"",
+        "bool" => "False",
+        _ => return None,
+    };
+    Some(value_str)
 }
 /// FlagDef represents a flag (sortof a parameter) as defined in the Maya documentation
 #[derive(Debug)]
@@ -272,18 +298,18 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
     if !create_flags.is_empty() {
         let return_type = def
             .return_type
-            .map_or(String::from("None"), |s| mel_tuple_type_to_py(&s));
+            .map_or(String::from("None"), |s| py_type_from_maya(&s));
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_short_signature(&create_flags),
+            &fmt_signature(&create_flags, ParamType::Long),
             &return_type,
             &def.description,
         ));
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_long_signature(&create_flags),
+            &fmt_signature(&create_flags, ParamType::Short),
             &return_type,
             &def.description,
         ));
@@ -296,14 +322,14 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_short_signature(&edit_flags),
+            &fmt_signature(&edit_flags, ParamType::Long),
             &return_type,
             &def.description,
         ));
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_long_signature(&edit_flags),
+            &fmt_signature(&edit_flags, ParamType::Short),
             &return_type,
             &def.description,
         ));
@@ -329,18 +355,26 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
 
             let flags: Vec<&FlagDef> = vec![&FLAG_QUERY, &new_flag];
 
-            let return_type = &mel_tuple_type_to_py(&flag.type_name);
+            // This is very hacky - just an experiment.
+            // If a query flag is described as a boolean, then it probably
+            // does not return a boolean.  We attempt to deduce its return
+            // type from its name.  The return type is sometimes described
+            // In the description - but that would be hard to parse.
+            let return_type: String = match flag.type_name.as_str() {
+                "boolean" => String::from(py_type_from_flag_name(&flag.longname).unwrap_or("bool")),
+                _ => py_type_from_maya(&flag.type_name),
+            };
 
             defs.push(fmt_py_def(
                 &def.name,
-                &fmt_short_signature(&flags),
+                &fmt_signature(&flags, ParamType::Long),
                 &return_type,
                 &def.description,
             ));
 
             defs.push(fmt_py_def(
                 &def.name,
-                &fmt_long_signature(&flags),
+                &fmt_signature(&flags, ParamType::Short),
                 &return_type,
                 &def.description,
             ));
@@ -361,27 +395,27 @@ fn fmt_func_py(def: FunctionDef) -> String {
     }
 }
 
-fn fmt_short_signature(flags: &Vec<&FlagDef>) -> String {
-    flags
-        .iter()
-        .map(|flag| {
-            format!(
-                "{}: {}",
-                flag.shortname,
-                mel_tuple_type_to_py(&flag.type_name),
-            )
-        })
-        .join(", ")
+enum ParamType {
+    Short,
+    Long,
 }
 
-fn fmt_long_signature(flags: &Vec<&FlagDef>) -> String {
+fn fmt_signature(flags: &Vec<&FlagDef>, param_type: ParamType) -> String {
     flags
         .iter()
         .map(|flag| {
+            let pytype = py_type_from_maya(&flag.type_name);
             format!(
-                "{}: {}",
-                flag.longname,
-                mel_tuple_type_to_py(&flag.type_name),
+                "{}: {} = {}",
+                match param_type {
+                    ParamType::Long => &flag.longname,
+                    ParamType::Short => &flag.shortname,
+                },
+                &pytype,
+                match default_value_for_type(&pytype) {
+                    Some(default_value) => default_value,
+                    None => "None", // FIXME: This is not valid.
+                }
             )
         })
         .join(", ")
