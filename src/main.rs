@@ -10,7 +10,7 @@ use std::iter;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum FuncMode {
     Create,
     Edit,
@@ -228,26 +228,131 @@ fn process_file<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Erro
     })
 }
 
-/// Formats a flag for use as a Python parameter
-fn fmt_flag_py(flag: &FlagDef) -> String {
-    format!(
-        "{}: {}",
-        flag.longname,
-        mel_tuple_type_to_py(&flag.type_name),
-    )
+/// Formats a FunctionDef into one or multiple type definitions
+fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
+    let create_flags: Vec<&FlagDef> = def
+        .flags
+        .iter()
+        .filter(|flag| flag.modes.contains(&FuncMode::Create))
+        .collect();
+    let mut edit_flags: Vec<&FlagDef> = def
+        .flags
+        .iter()
+        .filter(|flag| flag.modes.contains(&FuncMode::Edit))
+        .collect();
+    let mut query_flags: Vec<&FlagDef> = def
+        .flags
+        .iter()
+        .filter(|flag| flag.modes.contains(&FuncMode::Query))
+        .collect();
+
+    //let mut num_overloads = 0;
+
+    let mut defs: Vec<String> = vec![];
+
+    if !create_flags.is_empty() {
+        let return_type = def
+            .return_type
+            .map_or(String::from("None"), |s| mel_tuple_type_to_py(&s));
+
+        defs.push(fmt_py_def(
+            &def.name,
+            &fmt_short_signature(&create_flags),
+            &return_type,
+            &def.description,
+        ));
+
+        defs.push(fmt_py_def(
+            &def.name,
+            &fmt_long_signature(&create_flags),
+            &return_type,
+            &def.description,
+        ));
+    }
+
+    if !edit_flags.is_empty() {
+        let return_type = "None"; // FIXME: Unsure what return type is in edit mode. Same as create maybe?
+        let edit_flag = FlagDef {
+            shortname: String::from("e"),
+            longname: String::from("edit"),
+            modes: vec![],
+            type_name: String::from("boolean"),
+            description: String::from("Enable Edit mode"),
+        };
+        edit_flags.insert(0, &edit_flag);
+
+        defs.push(fmt_py_def(
+            &def.name,
+            &fmt_short_signature(&edit_flags),
+            &return_type,
+            &def.description,
+        ));
+
+        defs.push(fmt_py_def(
+            &def.name,
+            &fmt_long_signature(&edit_flags),
+            &return_type,
+            &def.description,
+        ));
+    }
+
+    // let query_flag = FlagDef {
+    //     shortname: String::from("q"),
+    //     longname: String::from("query"),
+    //     modes: vec![],
+    //     type_name: String::from("bool"),
+    //     description: String::from("Enable query mode"),
+    // };
+
+    // if !query_flags.is_empty() {
+    //     let return_type = "Any"; // FIXME: This is different depending on the query flags
+
+    // }
+
+    defs
 }
 
-/// Formats a FunctionDef as a Python type definition
 fn fmt_func_py(def: FunctionDef) -> String {
-    let return_type = def
-        .return_type
-        .map_or(String::from("None"), |s| mel_tuple_type_to_py(&s));
+    let defs = fmt_func_pys(def);
+    if defs.is_empty() {
+        String::new()
+    } else if defs.len() == 1 {
+        defs[0].clone() // FIXME: Surely I can move this String out somehow?
+    } else {
+        format!("\n@overload\n{0}", defs.join("\n@overload\n"))
+    }
+}
 
-    let signature = def.flags.iter().map(fmt_flag_py).join(", ");
+fn fmt_short_signature(flags: &Vec<&FlagDef>) -> String {
+    flags
+        .iter()
+        .map(|flag| {
+            format!(
+                "{}: {}",
+                flag.shortname,
+                mel_tuple_type_to_py(&flag.type_name),
+            )
+        })
+        .join(", ")
+}
 
+fn fmt_long_signature(flags: &Vec<&FlagDef>) -> String {
+    flags
+        .iter()
+        .map(|flag| {
+            format!(
+                "{}: {}",
+                flag.longname,
+                mel_tuple_type_to_py(&flag.type_name),
+            )
+        })
+        .join(", ")
+}
+
+fn fmt_py_def(name: &str, signature: &str, return_type: &str, description: &str) -> String {
     format!(
         "def {}(*args: Any, {}) -> {}:\n\t\"\"\"\n\t{}\n\t\"\"\"\n\t...",
-        &def.name, &signature, &return_type, &def.description
+        name, &signature, return_type, &description
     )
 }
 
