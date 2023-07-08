@@ -15,13 +15,14 @@ return types in query mode, will be a different overload.
 
 # Limitations
 
-## Short and Long-form parameters
+## Short and Long-form flags
 
-Mixing "short" and "long" form parameters is not allowed. For example, this will not work:
+Long and short-form flags cannot be mixed with these type definitions. This will produce an error:
 
 `maya.cmds.xform(q=True,matrix=True)`
 
 Instead do one of these:
 
 `maya.cmds.xform(q=True,m=True)`
+
 `maya.cmds.xform(query=True,matrix=True)`

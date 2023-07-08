@@ -230,6 +230,25 @@ fn process_file<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Erro
 
 /// Formats a FunctionDef into one or multiple type definitions
 fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
+    // This function is a mess and needs a rethink.
+    // Just wanted to get the functionality down first
+
+    lazy_static! {
+        static ref FLAG_EDIT: FlagDef = FlagDef {
+            shortname: String::from("e"),
+            longname: String::from("edit"),
+            modes: vec![],
+            type_name: String::from("boolean"),
+            description: String::from("Enable Edit mode"),
+        };
+        static ref FLAG_QUERY: FlagDef = FlagDef {
+            shortname: String::from("q"),
+            longname: String::from("query"),
+            modes: vec![],
+            type_name: String::from("boolean"),
+            description: String::from("Enable Query mode"),
+        };
+    }
     let create_flags: Vec<&FlagDef> = def
         .flags
         .iter()
@@ -240,7 +259,7 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
         .iter()
         .filter(|flag| flag.modes.contains(&FuncMode::Edit))
         .collect();
-    let mut query_flags: Vec<&FlagDef> = def
+    let query_flags: Vec<&FlagDef> = def
         .flags
         .iter()
         .filter(|flag| flag.modes.contains(&FuncMode::Query))
@@ -272,14 +291,8 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
 
     if !edit_flags.is_empty() {
         let return_type = "None"; // FIXME: Unsure what return type is in edit mode. Same as create maybe?
-        let edit_flag = FlagDef {
-            shortname: String::from("e"),
-            longname: String::from("edit"),
-            modes: vec![],
-            type_name: String::from("boolean"),
-            description: String::from("Enable Edit mode"),
-        };
-        edit_flags.insert(0, &edit_flag);
+
+        edit_flags.insert(0, &FLAG_EDIT);
 
         defs.push(fmt_py_def(
             &def.name,
@@ -296,18 +309,43 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
         ));
     }
 
-    // let query_flag = FlagDef {
-    //     shortname: String::from("q"),
-    //     longname: String::from("query"),
-    //     modes: vec![],
-    //     type_name: String::from("bool"),
-    //     description: String::from("Enable query mode"),
-    // };
+    if !query_flags.is_empty() {
+        // This is where things get a little experimental, and I need to test this in the wild.
 
-    // if !query_flags.is_empty() {
-    //     let return_type = "Any"; // FIXME: This is different depending on the query flags
+        for flag in query_flags {
+            // In query mode, the flag's return type is the functions' return type.
+            // And the flag is usually (I think?) changed to a boolean.
 
-    // }
+            // Also, when using query flags in this way it does not make sense to have more than one,
+            // So I will do an overload for each flag separately.
+
+            let new_flag = FlagDef {
+                longname: flag.longname.clone(),
+                shortname: flag.shortname.clone(),
+                type_name: String::from("boolean"),
+                modes: vec![],
+                description: flag.description.clone(),
+            };
+
+            let flags: Vec<&FlagDef> = vec![&FLAG_QUERY, &new_flag];
+
+            let return_type = &mel_tuple_type_to_py(&flag.type_name);
+
+            defs.push(fmt_py_def(
+                &def.name,
+                &fmt_short_signature(&flags),
+                &return_type,
+                &def.description,
+            ));
+
+            defs.push(fmt_py_def(
+                &def.name,
+                &fmt_long_signature(&flags),
+                &return_type,
+                &def.description,
+            ));
+        }
+    }
 
     defs
 }
