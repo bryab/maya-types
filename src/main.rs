@@ -4,33 +4,11 @@ use rayon::prelude::*;
 use regex::Regex;
 use scraper::{self, html, ElementRef, Selector};
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File};
+use std::io::prelude::Write;
 use std::iter;
 use std::path::Path;
 use std::path::PathBuf;
-// conversion_table = [
-//     [r"float\[3\]",   "Tuple[float, float, float]"],
-//     ["string",        "Text"],
-//     ["boolean",       "bool"],
-//     ["Boolean",       "bool"],
-//     ["object(s*)",    "Text"],
-//     ["node",          "Text"],
-//     ["name",          "Text"],
-//     ["target",        "Text"],
-//     ["script",        "Text"],
-//     ["uint",          "int"],
-//     ["angle",         "float"],
-//     ["floatrange",    "Tuple[float, float]"],
-//     ["timerange",     "Tuple[float, float]"],
-//     ["double",        "float"],
-//     ["time",          "float"],
-//     ["name",          "Text"],
-//     ["linear",        "float"],
-//     ["STRING",        "Text"],
-//     ["Int",           "int"],
-//     ["int64",         "int"],
-//     ["selectionItem", "Text"],
-// ]
 
 #[derive(Debug)]
 enum FuncMode {
@@ -42,68 +20,93 @@ enum FuncMode {
 /// Convert a MEL type to a Python type, accounting for tuples as well.
 fn mel_tuple_type_to_py(type_name: &str) -> String {
     lazy_static! {
-        static ref RE_TUPLE: Regex = Regex::new(r"(\w+)\[(\d)\]").unwrap();
+        static ref RE_ARRAY: Regex = Regex::new(r"(\w+)\[\]").unwrap();
+        static ref RE_TUPLE_TYPED: Regex = Regex::new(r"(\w+)\[(\d)\]").unwrap();
+        static ref RE_TUPLE_MIXED: Regex = Regex::new(r"^\[([a-z, ]+)\]$").unwrap();
     }
-    let (type_name, tuple_length) = if RE_TUPLE.is_match(type_name) {
-        let (_, type_name, tuple_length) = RE_TUPLE
+    if RE_ARRAY.is_match(&type_name) {
+        let type_name = RE_ARRAY
+            .captures(&type_name)
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .as_str();
+        format!("list[{}]", mel_type_to_py(type_name))
+    } else if RE_TUPLE_TYPED.is_match(type_name) {
+        let (_, type_name, tuple_length) = RE_TUPLE_TYPED
             .captures(&type_name)
             .unwrap()
             .iter()
             .filter_map(|m| Some(m?.as_str().to_string()))
             .next_tuple()
             .unwrap();
-        (
-            type_name.to_lowercase(),
-            tuple_length.parse::<usize>().unwrap(),
-        )
-    } else {
-        return String::from(mel_type_to_py(type_name));
-    };
 
-    format!(
-        "Tuple[{0}]",
-        iter::repeat(type_name).take(tuple_length).join(",")
-    )
+        let type_name = mel_type_to_py(&type_name);
+        let tuple_length = tuple_length.parse::<usize>().unwrap();
+
+        format!(
+            "Tuple[{0}]",
+            iter::repeat(type_name).take(tuple_length).join(", ")
+        )
+    } else if RE_TUPLE_MIXED.is_match(&type_name) {
+        let type_names: Vec<String> = RE_TUPLE_MIXED
+            .captures(&type_name)
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .as_str()
+            .split(", ")
+            .inspect(|s| {
+                if s.is_empty() {
+                    panic!("Empty type produced from: {}", type_name);
+                }
+            })
+            .map(|s| mel_type_to_py(s).to_string())
+            .collect();
+
+        format!("Tuple[{}]", type_names.join(", "))
+    } else {
+        String::from(mel_type_to_py(type_name))
+    }
 }
 /// Just a simple mapping from types found in the Maya docs to native Python types
 fn mel_type_to_py(type_name: &str) -> &str {
-    match type_name {
-        "int" => "int",
-        "string" => "Text",
+    if type_name.is_empty() {
+        panic!("Type name empty!");
+    }
+    match type_name.to_lowercase().as_str() {
+        "int" | "int64" | "uint" => "int",
+        "string" | "node" | "name" | "target" | "script" | "selectionitem" => "Text",
         "boolean" => "bool",
-        "node" => "Text",
-        "name" => "Text",
-        "target" => "Text",
-        "script" => "Text",
-        "uint" => "int",
-        "angle" => "float",
+        "float" | "angle" | "double" | "time" | "linear" => "float",
         "floatrange" => "Tuple[float,float]",
         "timerange" => "Tuple[float,float]",
-        "double" => "float",
-        "time" => "float",
-        "linear" => "float",
-        "int64" => "int",
-        "selectionitem" => "Text",
+        "any" => "Any",
         _ => {
             println!("Unknown type: {type_name}");
-            type_name
+            "Any"
         }
     }
-
-    // [r"float\[3\]",   "Tuple[float, float, float]"],
 }
+/// FlagDef represents a flag (sortof a parameter) as defined in the Maya documentation
 #[derive(Debug)]
-struct ParamData {
+struct FlagDef {
     pub longname: String,
     pub shortname: String,
+    /// The native MEL/C type, which will need to be converted into Python
     pub type_name: String,
+    /// A flag can exist in different 'modes'.  Currently I represent that in this way.
+    /// I may change my mind and actually treat flags with multiple modes as multiple flags,
+    /// As they operate completely differently in each mode.
     pub modes: Vec<FuncMode>,
     pub description: String,
+    // Some flags (I think only in query mode) change the return type of the function
+    // This is the most obscure part of the documentation and the hardest item to deduce.
+    // pub return_type: Option<String>,
 }
 
 /// Parses the main table describing the parameters of the function
-/// Types are converted into Python native types of typing Types
-fn process_params_table(table: ElementRef) -> Vec<ParamData> {
+fn process_params_table(table: ElementRef) -> Vec<FlagDef> {
     lazy_static! {
         static ref RE_PARAM: Regex = Regex::new(r"(\w+)\((\w+)\)").unwrap();
         static ref SEL_ROW: Selector = Selector::parse("body > table > tbody > tr").unwrap();
@@ -137,7 +140,7 @@ fn process_params_table(table: ElementRef) -> Vec<ParamData> {
             let type_name = type_col
                 .select(&SEL_CODE)
                 .flat_map(|code| code.text())
-                .map(mel_tuple_type_to_py)
+                //.map(mel_tuple_type_to_py)
                 .collect();
             let modes = mode_col
                 .select(&SEL_IMG)
@@ -154,7 +157,7 @@ fn process_params_table(table: ElementRef) -> Vec<ParamData> {
                 .collect::<String>()
                 .trim()
                 .to_string();
-            Some(ParamData {
+            Some(FlagDef {
                 longname,
                 shortname,
                 type_name,
@@ -162,7 +165,7 @@ fn process_params_table(table: ElementRef) -> Vec<ParamData> {
                 modes,
             })
         })
-        .inspect(|paramdata| println!("{:?}", paramdata))
+        //.inspect(|paramdata| println!("{:?}", paramdata))
         .collect()
     // let args: Vec<ArgData> = table.select(&row_selector).filter_map(parse_params_table_row_pair).nth(0).collect();
 }
@@ -171,41 +174,107 @@ fn process_params_table(table: ElementRef) -> Vec<ParamData> {
 struct FunctionDef {
     description: String,
     name: String,
-    params: Vec<ParamData>,
+    return_type: Option<String>,
+    flags: Vec<FlagDef>,
 }
 
 fn process_file<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Error>> {
     lazy_static! {
         static ref SEL_TABLE: Selector = Selector::parse("a ~ table").unwrap();
+        static ref SEL_NAME: Selector = Selector::parse("div#banner td > h1").unwrap();
+        static ref SEL_RETURN: Selector = Selector::parse("h2 + table i").unwrap();
+        static ref SEL_DESC: Selector = Selector::parse("p#synopsis + p").unwrap();
     }
 
     let html_body: String = fs::read_to_string(filename)?.parse()?;
     let document = scraper::Html::parse_document(&html_body);
+
+    let name: String = document
+        .select(&SEL_NAME)
+        .next()
+        .ok_or("No title found!")?
+        .text()
+        .next() // NB: Only getting first bit of text, because anything beyond this is not the name of the func.
+        .ok_or("No text found in title!")?
+        .trim()
+        .to_string();
+
+    let description: String = document
+        .select(&SEL_DESC)
+        .next()
+        .ok_or("No description found!")?
+        .text()
+        .next()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let return_type: Option<String> = match document.select(&SEL_RETURN).next() {
+        Some(e) => Some(e.text().next().unwrap().trim().to_string()),
+        None => None,
+    };
+
+    // Parse the parameters table
     let tbody = document
         .select(&SEL_TABLE)
         .next()
         .ok_or("No params table found!")?;
     let params = process_params_table(tbody);
     Ok(FunctionDef {
-        description: String::new(),
-        name: String::new(),
-        params,
+        description,
+        name,
+        return_type,
+        flags: params,
     })
 }
 
-fn process_files<P: AsRef<Path>>(dirpath: P) -> Vec<FunctionDef> {
+/// Formats a flag for use as a Python parameter
+fn fmt_flag_py(flag: &FlagDef) -> String {
+    format!(
+        "{}: {}",
+        flag.longname,
+        mel_tuple_type_to_py(&flag.type_name),
+    )
+}
+
+/// Formats a FunctionDef as a Python type definition
+fn fmt_func_py(def: FunctionDef) -> String {
+    let return_type = def
+        .return_type
+        .map_or(String::from("None"), |s| mel_tuple_type_to_py(&s));
+
+    let signature = def.flags.iter().map(fmt_flag_py).join(", ");
+
+    format!(
+        "def {}(*args: Any, {}) -> {}:\n\t\"\"\"\n\t{}\n\t\"\"\"\n\t...",
+        &def.name, &signature, &return_type, &def.description
+    )
+}
+
+fn process_files<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
     let filenames: Vec<PathBuf> = fs::read_dir(dirpath)
         .unwrap()
-        .map(|e| e.unwrap().path())
+        .filter_map(|e| {
+            let path = e.unwrap().path();
+            match path.extension().unwrap().to_str().unwrap() {
+                "html" => Some(path),
+                _ => None,
+            }
+        })
         .collect();
 
     filenames
         .into_par_iter()
         .filter_map(|filepath| process_file(filepath).ok())
+        .map(fmt_func_py)
         .collect()
 }
-fn main() {
-    for def in process_files("./source_docs/2023/CommandsPython") {
-        println!("{:?}", def);
+fn main() -> std::io::Result<()> {
+    let output_filepath = "./typings/maya/cmds/__init__.pyi";
+    let mut file = File::create(output_filepath)?;
+    writeln!(file, "from typing import Any, Text, Tuple, overload")?;
+    for python_def in process_files("./source_docs/2023/CommandsPython") {
+        writeln!(file, "{}", python_def)?;
     }
+    Ok(())
 }
