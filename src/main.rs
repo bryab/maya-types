@@ -1,8 +1,10 @@
+use core::prelude;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use regex::Regex;
 use scraper::{self, html, ElementRef, Selector};
+use std::any::type_name;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::prelude::Write;
@@ -15,6 +17,7 @@ enum FuncMode {
     Create,
     Edit,
     Query,
+    Multiuse,
 }
 
 /// Convert a MEL type to a Python type, accounting for tuples as well.
@@ -143,8 +146,12 @@ fn process_params_table(table: ElementRef) -> Vec<FlagDef> {
 
     table
         .select(&SEL_ROW)
+        .skip_while(|row| {
+            let cols: Vec<ElementRef> = row.select(&SEL_COL).collect();
+            cols.len() != 3
+        })
         // Skip the header row
-        .skip(2)
+        //.skip(2)
         .tuples()
         .filter_map(|(row1, row2)| {
             // let cols: Vec<ElementRef> = row1.select(&cellselector).collect();
@@ -174,7 +181,11 @@ fn process_params_table(table: ElementRef) -> Vec<FlagDef> {
                 .map(|mode| match mode {
                     "query" => FuncMode::Query,
                     "edit" => FuncMode::Edit,
-                    _ => FuncMode::Create,
+                    "create" => FuncMode::Create,
+                    "multiuse" => FuncMode::Multiuse,
+                    _ => {
+                        panic!("Unknown mode: {}", &mode);
+                    }
                 })
                 .collect();
             let description: String = row2
@@ -201,15 +212,74 @@ struct FunctionDef {
     description: String,
     name: String,
     return_type: Option<String>,
+    positional_params: Option<Vec<ParamDef>>,
     flags: Vec<FlagDef>,
 }
+#[derive(Debug)]
+struct ParamDef {
+    type_name: String,
+    optional: bool,
+    variadic: bool,
+}
 
-fn process_file<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Error>> {
+fn parse_synopsis(synopsis: ElementRef) -> Option<Vec<ParamDef>> {
+    lazy_static! {
+        static ref RE_POSITIONAL_PARAMS: Regex = Regex::new(r"\(([^=]+?)\,").unwrap();
+        static ref RE_POSITIONAL_PARAM_ITEMS: Regex = Regex::new(r"(.+?[ $]|\[.+?\])").unwrap();
+        static ref RE_OPTIONAL_PARAM: Regex = Regex::new(r"\[(.+)\]").unwrap();
+    }
+    let synopsis_text = synopsis.text().collect::<String>();
+    let positional_param_text = RE_POSITIONAL_PARAMS
+        .captures(&synopsis_text)
+        .and_then(|c| Some(c.get(1).unwrap().as_str().trim().to_string()))?;
+
+    // Positional params can be separated by spaces, or if they're optional, just by brackets.
+    // So like this: string string
+    // Or like this: [string][string]
+
+    Some(
+        RE_POSITIONAL_PARAM_ITEMS
+            .captures_iter(&positional_param_text)
+            .map(|c| c.get(1).unwrap().as_str())
+            //.inspect(|s| println!("{}", s))
+            .map(|s| {
+                let (type_name, optional) = if RE_OPTIONAL_PARAM.is_match(&s) {
+                    let type_name = RE_OPTIONAL_PARAM
+                        .captures(s)
+                        .unwrap()
+                        .get(1)
+                        .unwrap()
+                        .as_str();
+                    (type_name, true)
+                } else {
+                    (s, false)
+                };
+
+                let (type_name, variadic) = match type_name.ends_with("...") {
+                    true => (
+                        type_name.split("...").next().unwrap().trim().to_string(),
+                        true,
+                    ),
+                    false => (type_name.trim().to_string(), false),
+                };
+
+                ParamDef {
+                    type_name,
+                    optional,
+                    variadic,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Error>> {
     lazy_static! {
         static ref SEL_TABLE: Selector = Selector::parse("a ~ table").unwrap();
         static ref SEL_NAME: Selector = Selector::parse("div#banner td > h1").unwrap();
         static ref SEL_RETURN: Selector = Selector::parse("h2 + table i").unwrap();
-        static ref SEL_DESC: Selector = Selector::parse("p#synopsis + p").unwrap();
+        static ref SEL_SYN: Selector = Selector::parse("p#synopsis").unwrap();
+        static ref SEL_DESC: Selector = Selector::parse("p#synopsis ~ p").unwrap();
     }
 
     let html_body: String = fs::read_to_string(filename)?.parse()?;
@@ -225,15 +295,14 @@ fn process_file<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Erro
         .trim()
         .to_string();
 
-    let description: String = document
-        .select(&SEL_DESC)
-        .next()
-        .ok_or("No description found!")?
-        .text()
-        .next()
-        .unwrap()
-        .trim()
-        .to_string();
+    let positional_params = parse_synopsis(
+        document
+            .select(&SEL_SYN)
+            .next()
+            .expect("Should always have synopsis"),
+    );
+
+    let description: String = document.select(&SEL_DESC).flat_map(|e| e.text()).collect();
 
     let return_type: Option<String> = match document.select(&SEL_RETURN).next() {
         Some(e) => Some(e.text().next().unwrap().trim().to_string()),
@@ -251,13 +320,18 @@ fn process_file<P: AsRef<Path>>(filename: P) -> Result<FunctionDef, Box<dyn Erro
         name,
         return_type,
         flags: params,
+        positional_params,
     })
 }
 
 /// Formats a FunctionDef into one or multiple type definitions
-fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
+fn fmt_func_pys(def: &FunctionDef) -> Vec<String> {
     // This function is a mess and needs a rethink.
     // Just wanted to get the functionality down first
+    match &def.positional_params {
+        Some(params) => println!("{}: {:?}", def.name, params),
+        None => (),
+    };
 
     lazy_static! {
         static ref FLAG_EDIT: FlagDef = FlagDef {
@@ -278,7 +352,7 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
     let create_flags: Vec<&FlagDef> = def
         .flags
         .iter()
-        .filter(|flag| flag.modes.contains(&FuncMode::Create))
+        .filter(|flag| flag.modes.is_empty() || flag.modes.contains(&FuncMode::Create))
         .collect();
     let mut edit_flags: Vec<&FlagDef> = def
         .flags
@@ -298,18 +372,19 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
     if !create_flags.is_empty() {
         let return_type = def
             .return_type
+            .clone()
             .map_or(String::from("None"), |s| py_type_from_maya(&s));
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_signature(&create_flags, ParamType::Long),
+            &fmt_signature(&def.positional_params, &create_flags, FlagNameType::Long),
             &return_type,
             &def.description,
         ));
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_signature(&create_flags, ParamType::Short),
+            &fmt_signature(&def.positional_params, &create_flags, FlagNameType::Short),
             &return_type,
             &def.description,
         ));
@@ -322,14 +397,14 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_signature(&edit_flags, ParamType::Long),
+            &fmt_signature(&def.positional_params, &edit_flags, FlagNameType::Long),
             &return_type,
             &def.description,
         ));
 
         defs.push(fmt_py_def(
             &def.name,
-            &fmt_signature(&edit_flags, ParamType::Short),
+            &fmt_signature(&def.positional_params, &edit_flags, FlagNameType::Short),
             &return_type,
             &def.description,
         ));
@@ -367,16 +442,16 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
 
             defs.push(fmt_py_def(
                 &def.name,
-                &fmt_signature(&flags, ParamType::Long),
+                &fmt_signature(&def.positional_params, &flags, FlagNameType::Long),
                 &return_type,
-                &def.description,
+                &format!("[Query Mode: {}]\n{}", flag.longname, flag.description),
             ));
 
             defs.push(fmt_py_def(
                 &def.name,
-                &fmt_signature(&flags, ParamType::Short),
+                &fmt_signature(&def.positional_params, &flags, FlagNameType::Short),
                 &return_type,
-                &def.description,
+                &format!("[Query Mode: {}]\n{}", flag.longname, flag.description),
             ));
         }
     }
@@ -385,9 +460,9 @@ fn fmt_func_pys(def: FunctionDef) -> Vec<String> {
 }
 
 fn fmt_func_py(def: FunctionDef) -> String {
-    let defs = fmt_func_pys(def);
+    let defs = fmt_func_pys(&def);
     if defs.is_empty() {
-        String::new()
+        panic!("No function defs produced for {:?}!", &def)
     } else if defs.len() == 1 {
         defs[0].clone() // FIXME: Surely I can move this String out somehow?
     } else {
@@ -395,40 +470,74 @@ fn fmt_func_py(def: FunctionDef) -> String {
     }
 }
 
-enum ParamType {
+enum FlagNameType {
     Short,
     Long,
 }
 
-fn fmt_signature(flags: &Vec<&FlagDef>, param_type: ParamType) -> String {
-    flags
-        .iter()
-        .map(|flag| {
-            let pytype = py_type_from_maya(&flag.type_name);
-            format!(
-                "{}: {} = {}",
-                match param_type {
-                    ParamType::Long => &flag.longname,
-                    ParamType::Short => &flag.shortname,
-                },
-                &pytype,
-                match default_value_for_type(&pytype) {
-                    Some(default_value) => default_value,
-                    None => "None", // FIXME: This is not valid.
-                }
-            )
-        })
-        .join(", ")
+fn fmt_signature(
+    params: &Option<Vec<ParamDef>>,
+    flags: &Vec<&FlagDef>,
+    flag_name_type: FlagNameType,
+) -> String {
+    let mut params = match params {
+        Some(params) => params
+            .iter()
+            .enumerate()
+            .map(|(i, param)| {
+                format!(
+                    "{}{}{}: {}{}",
+                    match param.variadic {
+                        true => "*",
+                        false => "",
+                    },
+                    &param.type_name,
+                    i,
+                    py_type_from_maya(&param.type_name),
+                    match param.optional && !param.variadic {
+                        true => " = None",
+                        false => "",
+                    }
+                )
+            })
+            .collect(),
+        None => vec![],
+    };
+
+    params.extend(flags.iter().map(|flag| {
+        let mut pytype = py_type_from_maya(&flag.type_name);
+        // FIXME: The above func could take the whole flag struct and thus produce this special
+        // Multiuse type
+        if flag.modes.contains(&FuncMode::Multiuse) {
+            pytype = format!("{0} | list[{0}] | Tuple[{0}, ...]", pytype);
+        }
+        format!(
+            "{}: {} = {}",
+            match flag_name_type {
+                FlagNameType::Long => &flag.longname,
+                FlagNameType::Short => &flag.shortname,
+            },
+            &pytype,
+            match default_value_for_type(&pytype) {
+                Some(default_value) => default_value,
+                None => "None", // FIXME: This is not valid.
+            }
+        )
+    }));
+    params.join(", ")
 }
 
 fn fmt_py_def(name: &str, signature: &str, return_type: &str, description: &str) -> String {
     format!(
-        "def {}(*args: Any, {}) -> {}:\n\t\"\"\"\n\t{}\n\t\"\"\"\n\t...",
-        name, &signature, return_type, &description
+        "def {}({}) -> {}:\n\t\"\"\"\n\t{}\n\t\"\"\"\n\t...",
+        name,
+        &signature,
+        return_type,
+        &description.replace("\n", "\n\t").trim()
     )
 }
 
-fn process_files<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
+fn parse_all_maya_docs<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
     let filenames: Vec<PathBuf> = fs::read_dir(dirpath)
         .unwrap()
         .filter_map(|e| {
@@ -442,7 +551,7 @@ fn process_files<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
 
     filenames
         .into_par_iter()
-        .filter_map(|filepath| process_file(filepath).ok())
+        .filter_map(|filepath| parse_maya_function_doc(filepath).ok())
         .map(fmt_func_py)
         .collect()
 }
@@ -450,7 +559,7 @@ fn main() -> std::io::Result<()> {
     let output_filepath = "./typings/maya/cmds/__init__.pyi";
     let mut file = File::create(output_filepath)?;
     writeln!(file, "from typing import Any, Text, Tuple, overload")?;
-    for python_def in process_files("./source_docs/2023/CommandsPython") {
+    for python_def in parse_all_maya_docs("./source_docs/2023/CommandsPython") {
         writeln!(file, "{}", python_def)?;
     }
     Ok(())
