@@ -304,21 +304,20 @@ fn fmt_signature(params: &Vec<PyParamDef>) -> String {
             }
             return true;
         })
-        .map(|param| match &param.default_value {
-            Some(default_value) => {
-                format!("{}: {} = {}", param.name, param.type_name, default_value)
-            }
-            None => {
-                format!(
-                    "{}{}: {}",
-                    match param.variadic {
-                        true => "*",
-                        false => "",
-                    },
-                    param.name,
-                    param.type_name
-                )
-            }
+        .map(|param| {
+            format!(
+                "{}{}: {}{}",
+                match param.variadic {
+                    true => "*",
+                    false => "",
+                },
+                param.name,
+                param.type_name,
+                match &param.default_value {
+                    Some(default_value) => format!(" = {}", &default_value),
+                    None => String::new(),
+                }
+            )
         })
         .join(", ")
 }
@@ -442,7 +441,7 @@ fn py_params_from_maya(
     } else {
         // Quick fix - If the final arg is not variadic, make it so.
         // Most of the time, if a function takes a list, it also takes it as multiple arguments instead.
-        let mut final_arg = args.last_mut().unwrap();
+        let final_arg = args.last_mut().unwrap();
         if !final_arg.variadic {
             final_arg.variadic = true;
         }
@@ -701,6 +700,78 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
     })
 }
 
+fn apply_func_fixes(mut def: MayaFuncDef) -> MayaFuncDef {
+    // This is just a test of a possible pipeline, which would load
+    // Fixes to the documentation from an external file.
+    if (def.name == "file") {
+        def.params = vec![MayaParamDef {
+            type_name: "filename".to_string(),
+            optional: false,
+            variadic: false,
+        }]
+    }
+    def
+}
+
+fn add_missing_funcs() -> Vec<MayaFuncDef> {
+    // This is just a test of a possible pipeline, which would load
+    // Fixes to the documentation from an external file.
+
+    vec![
+        MayaFuncDef {
+            name: "FBXExport".to_string(),
+            params: vec![
+                (MayaParamDef {
+                    type_name: "args".to_string(),
+                    variadic: true,
+                    optional: false,
+                }),
+            ],
+            description: String::new(),
+            return_type: Some("Any".to_string()),
+            flags: vec![],
+        },
+        MayaFuncDef {
+            name: "AbcExport".to_string(),
+            params: vec![
+                (MayaParamDef {
+                    type_name: "args".to_string(),
+                    variadic: true,
+                    optional: false,
+                }),
+            ],
+            description: String::new(),
+            return_type: Some("Any".to_string()),
+            flags: vec![],
+        },
+        MayaFuncDef {
+            name: "houdiniAsset".to_string(),
+            params: vec![
+                (MayaParamDef {
+                    type_name: "args".to_string(),
+                    variadic: true,
+                    optional: false,
+                }),
+            ],
+            description: String::new(),
+            return_type: Some("Any".to_string()),
+            flags: vec![],
+        },
+        MayaFuncDef {
+            name: "invertShape".to_string(),
+            params: vec![
+                (MayaParamDef {
+                    type_name: "args".to_string(),
+                    variadic: true,
+                    optional: false,
+                }),
+            ],
+            description: String::new(),
+            return_type: Some("string".to_string()),
+            flags: vec![],
+        },
+    ]
+}
 /// Parses all the files in a Maya documentation folder, producing a Vec of the Python defintion of each
 fn parse_all_maya_docs<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
     let filenames: Vec<PathBuf> = fs::read_dir(dirpath)
@@ -717,6 +788,8 @@ fn parse_all_maya_docs<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
     filenames
         .into_par_iter()
         .filter_map(|filepath| parse_maya_function_doc(filepath).ok())
+        .map(apply_func_fixes)
+        .chain(add_missing_funcs())
         .map(fmt_func_py)
         .collect()
 }
@@ -842,6 +915,19 @@ mod tests {
         assert_eq!(result.params[0].type_name, "string");
         assert_eq!(result.params[0].variadic, false);
         assert_eq!(result.params[0].optional, false);
+        fmt_func_pys(&result);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_group() {
+        let filepath = "./source_docs/2023/CommandsPython/group.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "group");
+        assert_eq!(result.flags.len(), 7);
+        assert_eq!(result.params[0].type_name, "objects");
+        assert_eq!(result.params[0].variadic, true);
+        assert_eq!(result.params[0].optional, true);
         fmt_func_pys(&result);
     }
 }
