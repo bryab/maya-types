@@ -1,10 +1,10 @@
-use core::prelude;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use regex::Regex;
-use scraper::{self, html, ElementRef, Selector};
-use std::any::type_name;
+use scraper::{self, ElementRef, Selector};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::prelude::Write;
@@ -34,6 +34,7 @@ fn py_type_from_maya(type_name: &str) -> String {
             .get(1)
             .unwrap()
             .as_str();
+        //assert!(!type_name.is_empty());
         format!("list[{}]", py_type_from_maya_simple(type_name))
     } else if RE_TUPLE_TYPED.is_match(type_name) {
         let (_, type_name, tuple_length) = RE_TUPLE_TYPED
@@ -43,7 +44,7 @@ fn py_type_from_maya(type_name: &str) -> String {
             .filter_map(|m| Some(m?.as_str().to_string()))
             .next_tuple()
             .unwrap();
-
+        //assert!(!type_name.is_empty());
         let type_name = py_type_from_maya_simple(&type_name);
         let tuple_length = tuple_length.parse::<usize>().unwrap();
 
@@ -85,6 +86,11 @@ fn py_type_from_maya_simple(type_name: &str) -> &str {
         "floatrange" => "Tuple[float,float]",
         "timerange" => "Tuple[float,float]",
         "any" => "Any",
+        "filename" | "message" | "subd" | "stringstring" | "editorname" | "context"
+        | "groupname" | "surfaceisoparm" | "imagename" | "attribute" | "contextname"
+        | "panelname" | "curve" | "surface" | "poly" | "dagobject" | "camera" => "Text",
+        "animatedobject" | "targetlist" | "attributelist" | "object" | "objects"
+        | "selectionlist" => "Text | list[Text] | Tuple[Text, ...]",
         _ => {
             println!("Unknown type: {type_name}");
             "Any"
@@ -219,37 +225,32 @@ fn process_params_table(table: ElementRef) -> Vec<MayaFlagDef> {
 /// The flags are ignored as they are described better in the table below it.
 fn parse_synopsis(synopsis: ElementRef) -> Option<Vec<MayaParamDef>> {
     lazy_static! {
-        static ref RE_POSITIONAL_PARAMS: Regex = Regex::new(r"\(([^=]+?)\,").unwrap();
-        static ref RE_POSITIONAL_PARAM_ITEMS: Regex = Regex::new(r"(.+?[ $]|\[.+?\])").unwrap();
-        static ref RE_OPTIONAL_PARAM: Regex = Regex::new(r"\[(.+)\]").unwrap();
+        static ref RE_POSITIONAL_PARAMS: Regex = Regex::new(r"\(([^=]+?),").unwrap();
+        static ref RE_POSITIONAL_PARAM_ITEMS: Regex = Regex::new(r"[a-z,A-Z]+ ?\.?+").unwrap();
     }
     let synopsis_text = synopsis.text().collect::<String>();
     let positional_param_text = RE_POSITIONAL_PARAMS
         .captures(&synopsis_text)
         .and_then(|c| Some(c.get(1).unwrap().as_str().trim().to_string()))?;
 
-    // Positional params can be separated by spaces, or if they're optional, just by brackets.
-    // So like this: string string
-    // Or like this: [string][string]
+    //println!("{}", positional_param_text);
+
+    // The syntax of the positional parameters is a bit odd, so I am parsing it in an odd way.
+    // I just find where the 'optional' begins first (first bracket)
+    // Then iterate over all the words and check if they're beyond the optional index.
+
+    let optional_index = positional_param_text.find("[");
 
     Some(
         RE_POSITIONAL_PARAM_ITEMS
             .captures_iter(&positional_param_text)
-            .map(|c| c.get(1).unwrap().as_str())
-            //.inspect(|s| println!("{}", s))
-            .map(|s| {
-                let (type_name, optional) = if RE_OPTIONAL_PARAM.is_match(&s) {
-                    let type_name = RE_OPTIONAL_PARAM
-                        .captures(s)
-                        .unwrap()
-                        .get(1)
-                        .unwrap()
-                        .as_str();
-                    (type_name, true)
-                } else {
-                    (s, false)
+            .map(|c| {
+                let cap = c.get(0).unwrap();
+                let optional = match optional_index {
+                    Some(optional_index) => cap.start() > optional_index,
+                    None => false,
                 };
-
+                let type_name = cap.as_str();
                 let (type_name, variadic) = match type_name.ends_with("...") {
                     true => (
                         type_name.split("...").next().unwrap().trim().to_string(),
@@ -264,6 +265,7 @@ fn parse_synopsis(synopsis: ElementRef) -> Option<Vec<MayaParamDef>> {
                     variadic,
                 }
             })
+            //.inspect(|s| println!("{:?}", s))
             .collect(),
     )
 }
@@ -285,8 +287,20 @@ enum FlagNameType {
 }
 
 fn fmt_signature(params: &Vec<PyParamDef>) -> String {
+    // There are cases where there's a variadic parameter before others
+    // In the maya docs.  We ignore all params that follow the variadic.
+    let mut variadic_broken = false;
     params
         .iter()
+        .filter(|param| {
+            if param.variadic {
+                if variadic_broken {
+                    return false;
+                }
+                variadic_broken = true;
+            }
+            return true;
+        })
         .map(|param| match &param.default_value {
             Some(default_value) => {
                 format!("{}: {} = {}", param.name, param.type_name, default_value)
@@ -333,60 +347,80 @@ struct PyParamDef {
     variadic: bool,
 }
 
-// struct PyFuncDef {
-//     name: String,
-//     params: Vec<PyParamDef>,
-//     description: String,
-//     type_name: String,
-// }
-
 fn py_params_from_maya(
     params: &Vec<MayaParamDef>,
     flags: &Vec<&MayaFlagDef>,
     name_type: FlagNameType,
 ) -> Vec<PyParamDef> {
-    let args = params.iter().map(|param| {
-        let type_name = py_type_from_maya(&param.type_name);
-        let default_value = match param.optional {
-            true => Some(
-                default_value_for_type(&type_name)
-                    .unwrap_or("None")
-                    .to_string(),
-            ),
-            false => None,
-        };
+    let param_names = RefCell::new(HashSet::new());
 
-        PyParamDef {
-            name: param.type_name.clone(), // FIXME - Can't have multiple args with same name
-            type_name,
-            default_value,
-            description: String::new(), // FIXME: description should be optional
-            variadic: param.variadic,
-        }
-    });
-
-    let kwargs = flags.iter().map(|flag| {
-        let type_name = py_type_from_maya(&flag.type_name);
-        let default_value = Some(
-            default_value_for_type(&type_name)
-                .unwrap_or("None")
-                .to_string(),
-        );
-
-        PyParamDef {
-            name: match name_type {
+    let kwargs: Vec<PyParamDef> = flags
+        .iter()
+        .map(|flag| {
+            assert!(!&flag.type_name.is_empty());
+            let type_name = py_type_from_maya(&flag.type_name);
+            let (type_name, default_value) = match default_value_for_type(&type_name) {
+                Some(default_value) => (type_name.clone(), default_value), // FIXME: Clone should be unnecessary here.
+                None => (format!("Optional[{}]", &type_name), "None"),
+            };
+            let mut name = match name_type {
                 FlagNameType::Long => &flag.longname,
                 FlagNameType::Short => &flag.shortname,
             }
-            .to_string(),
-            type_name,
-            default_value,
-            description: flag.description.clone(),
-            variadic: false,
-        }
-    });
+            .clone();
+            while param_names.borrow().contains(&name) {
+                println!(
+                    "Error: Repeat kwarg name, should not be possible: {}",
+                    &name
+                );
+                name = format!("{}_", name);
+            }
+            param_names.borrow_mut().insert(name.clone());
+            PyParamDef {
+                name: name.to_string(),
+                type_name: type_name.to_string(),
+                default_value: Some(default_value.to_string()),
+                description: flag.description.clone(),
+                variadic: false,
+            }
+        })
+        .collect(); // Note I am collecting this because I need kwargs to be processed first.
 
-    args.chain(kwargs).collect()
+    let mut args: Vec<PyParamDef> = params
+        .iter()
+        .map(|param| {
+            let type_name = py_type_from_maya(&param.type_name);
+            let (type_name, default_value) = match param.optional {
+                true => {
+                    match default_value_for_type(&type_name) {
+                        Some(default_value) => (type_name.clone(), Some(default_value.to_string())), // FIXME: Clone should be unnecessary here.
+                        None => (
+                            format!("Optional[{}]", &type_name),
+                            Some("None".to_string()),
+                        ),
+                    }
+                }
+                false => (type_name, None),
+            };
+
+            let mut name = param.type_name.clone();
+            while param_names.borrow().contains(&name) {
+                name = format!("{}_", name);
+            }
+            param_names.borrow_mut().insert(name.clone());
+
+            PyParamDef {
+                name,
+                type_name,
+                default_value,
+                description: String::new(), // FIXME: description should be optional
+                variadic: param.variadic,
+            }
+        })
+        .collect();
+
+    args.extend(kwargs);
+    args
 }
 
 fn double_defs(
@@ -419,6 +453,8 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     //     Some(params) => println!("{}: {:?}", def.name, params),
     //     None => (),
     // };
+
+    //println!("Function name: {}", &def.name);
 
     lazy_static! {
         static ref FLAG_EDIT: MayaFlagDef = MayaFlagDef {
@@ -518,7 +554,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             // type from its name.  The return type is sometimes described
             // In the description - but that would be hard to parse.
             let return_type: String = match flag.type_name.as_str() {
-                "boolean" => String::from(py_type_from_flag_name(&flag.longname).unwrap_or("bool")),
+                "boolean" => String::from(py_type_from_flag_name(&flag.longname).unwrap_or("Any")),
                 _ => py_type_from_maya(&flag.type_name),
             };
 
@@ -560,13 +596,15 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         .trim()
         .to_string();
 
-    let positional_params = parse_synopsis(
+    let params = parse_synopsis(
         document
             .select(&SEL_SYN)
             .next()
             .expect("Should always have synopsis"),
     )
     .unwrap_or(vec![]);
+
+    //assert!(positional_params.len() > 0);
 
     let description: String = document.select(&SEL_DESC).flat_map(|e| e.text()).collect();
 
@@ -580,13 +618,23 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         .select(&SEL_TABLE)
         .next()
         .ok_or("No params table found!")?;
-    let params = process_params_table(tbody);
+    let flags = process_params_table(tbody);
+
+    for param in &params {
+        assert!(
+            !&param.type_name.is_empty(),
+            "{}: Empty param from {:?}",
+            &name,
+            &params
+        );
+    }
+
     Ok(MayaFuncDef {
         description,
         name,
         return_type,
-        flags: params,
-        params: positional_params,
+        flags,
+        params,
     })
 }
 
@@ -613,9 +661,98 @@ fn parse_all_maya_docs<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
 fn main() -> std::io::Result<()> {
     let output_filepath = "./typings/maya/cmds/__init__.pyi";
     let mut file = File::create(output_filepath)?;
-    writeln!(file, "from typing import Any, Text, Tuple, overload")?;
+    writeln!(
+        file,
+        "from typing import Any, Text, Tuple, overload, Optional"
+    )?;
     for python_def in parse_all_maya_docs("./source_docs/2023/CommandsPython") {
         writeln!(file, "{}", python_def)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use super::*;
+
+    #[test]
+    fn test_xform() {
+        let filepath = "./source_docs/2023/CommandsPython/xform.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "xform");
+        assert_eq!(result.flags.len(), 33);
+        assert_eq!(result.params.len(), 1);
+        assert_eq!(result.params[0].type_name, "objects");
+        assert_eq!(result.params[0].variadic, true);
+        assert_eq!(result.params[0].optional, true);
+        fmt_func_pys(&result);
+        // assert_eq!(s.length() > 0);
+    }
+
+    #[test]
+    fn test_delete() {
+        let filepath = "./source_docs/2023/CommandsPython/delete.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "delete");
+        assert_eq!(result.flags.len(), 14);
+        assert_eq!(result.params.len(), 1);
+        assert_eq!(result.params[0].type_name, "objects");
+        assert_eq!(result.params[0].variadic, false);
+        assert_eq!(result.params[0].optional, false);
+        fmt_func_pys(&result);
+        // assert_eq!(s.length() > 0);
+    }
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_bakeSimulation() {
+        let filepath = "./source_docs/2023/CommandsPython/bakeSimulation.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "bakeSimulation");
+        assert_eq!(result.flags.len(), 21);
+        assert_eq!(result.params.len(), 1);
+        assert_eq!(result.params[0].type_name, "objects");
+        assert_eq!(result.params[0].variadic, false);
+        assert_eq!(result.params[0].optional, false);
+        fmt_func_pys(&result);
+        //assert_eq!(s.length() > 0);
+    }
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_poleVectorConstraint() {
+        let filepath = "./source_docs/2023/CommandsPython/poleVectorConstraint.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "poleVectorConstraint");
+        assert_eq!(result.flags.len(), 6);
+        assert_eq!(result.params.len(), 2);
+        assert_eq!(result.params[0].type_name, "target");
+        assert_eq!(result.params[0].variadic, true);
+        assert_eq!(result.params[0].optional, true);
+        assert_eq!(result.params[1].type_name, "object");
+        assert_eq!(result.params[1].variadic, false);
+        assert_eq!(result.params[1].optional, true);
+        fmt_func_pys(&result);
+        //assert_eq!(s.length() > 0);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_bevelPlus() {
+        let filepath = "./source_docs/2023/CommandsPython/bevelPlus.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "bevelPlus");
+        assert_eq!(result.flags.len(), 11);
+        //assert_eq!(result.params.len(), 3);
+        assert_eq!(result.params[0].type_name, "curve");
+        assert_eq!(result.params[0].variadic, false);
+        assert_eq!(result.params[0].optional, false);
+        assert_eq!(result.params[1].type_name, "curve");
+        assert_eq!(result.params[1].variadic, false);
+        assert_eq!(result.params[1].optional, true);
+        // assert_eq!(result.params[1].type_name, "curve__");
+        // assert_eq!(result.params[1].variadic, true);
+        // assert_eq!(result.params[1].optional, true);
+        fmt_func_pys(&result);
+        //assert_eq!(s.length() > 0);
+    }
 }
