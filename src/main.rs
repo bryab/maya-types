@@ -13,7 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq)]
-enum ParamMode {
+enum FlagMode {
     Create,
     Edit,
     Query,
@@ -88,8 +88,8 @@ fn py_type_from_maya_simple(type_name: &str) -> &str {
         "any" => "Any",
         "filename" | "message" | "subd" | "stringstring" | "editorname" | "context"
         | "groupname" | "surfaceisoparm" | "imagename" | "attribute" | "contextname"
-        | "panelname" | "curve" | "surface" | "poly" | "dagobject" | "camera" => "Text",
-        "animatedobject" | "targetlist" | "attributelist" | "object" | "objects"
+        | "panelname" | "curve" | "surface" | "poly" | "dagobject" | "camera"
+        | "animatedobject" | "targetlist" | "attributelist" | "object" | "objects"
         | "selectionlist" => "Text | list[Text] | Tuple[Text, ...]",
         _ => {
             println!("Unknown type: {type_name}");
@@ -136,7 +136,7 @@ struct MayaFlagDef {
     /// A flag can exist in different 'modes'.  Currently I represent that in this way.
     /// I may change my mind and actually treat flags with multiple modes as multiple flags,
     /// As they operate completely differently in each mode.
-    pub modes: Vec<ParamMode>,
+    pub modes: Vec<FlagMode>,
     pub description: String,
 }
 
@@ -160,7 +160,7 @@ struct MayaFuncDef {
 }
 
 /// Parses the main table describing the parameters of the function
-fn process_params_table(table: ElementRef) -> Vec<MayaFlagDef> {
+fn process_flags_table(table: ElementRef) -> Vec<MayaFlagDef> {
     lazy_static! {
         static ref RE_PARAM: Regex = Regex::new(r"(\w+)\((\w+)\)").unwrap();
         static ref SEL_ROW: Selector = Selector::parse("body > table > tbody > tr").unwrap();
@@ -195,10 +195,10 @@ fn process_params_table(table: ElementRef) -> Vec<MayaFlagDef> {
                 .select(&SEL_IMG)
                 .filter_map(|img| img.value().attr("title"))
                 .map(|mode| match mode {
-                    "query" => ParamMode::Query,
-                    "edit" => ParamMode::Edit,
-                    "create" => ParamMode::Create,
-                    "multiuse" => ParamMode::Multiuse,
+                    "query" => FlagMode::Query,
+                    "edit" => FlagMode::Edit,
+                    "create" => FlagMode::Create,
+                    "multiuse" => FlagMode::Multiuse,
                     _ => {
                         panic!("Unknown mode: {}", &mode);
                     }
@@ -225,7 +225,7 @@ fn process_params_table(table: ElementRef) -> Vec<MayaFlagDef> {
 /// The flags are ignored as they are described better in the table below it.
 fn parse_synopsis(synopsis: ElementRef) -> Option<Vec<MayaParamDef>> {
     lazy_static! {
-        static ref RE_POSITIONAL_PARAMS: Regex = Regex::new(r"\(([^=]+?),").unwrap();
+        static ref RE_POSITIONAL_PARAMS: Regex = Regex::new(r"\(([^=]+?)[,\)]").unwrap();
         static ref RE_POSITIONAL_PARAM_ITEMS: Regex = Regex::new(r"[a-z,A-Z]+ ?\.?+").unwrap();
     }
     let synopsis_text = synopsis.text().collect::<String>();
@@ -287,6 +287,9 @@ enum FlagNameType {
 }
 
 fn fmt_signature(params: &Vec<PyParamDef>) -> String {
+    if params.is_empty() {
+        return "".to_string();
+    }
     // There are cases where there's a variadic parameter before others
     // In the maya docs.  We ignore all params that follow the variadic.
     let mut variadic_broken = false;
@@ -376,9 +379,15 @@ fn py_params_from_maya(
                 name = format!("{}_", name);
             }
             param_names.borrow_mut().insert(name.clone());
+
+            let type_name = if (flag.modes.contains(&FlagMode::Multiuse)) {
+                format!("{0} | list[{0}] | Tuple[{0},...]", &type_name)
+            } else {
+                type_name.to_string()
+            };
             PyParamDef {
                 name: name.to_string(),
-                type_name: type_name.to_string(),
+                type_name,
                 default_value: Some(default_value.to_string()),
                 description: flag.description.clone(),
                 variadic: false,
@@ -418,6 +427,26 @@ fn py_params_from_maya(
             }
         })
         .collect();
+
+    // Quick fix - If there are no args, then make an "Any" variadic.
+    // There are many functions that take arguments, but they are totally undocumented except in the examples.
+
+    if args.len() == 0 {
+        args.push(PyParamDef {
+            name: "unknown".to_string(),
+            type_name: "Any".to_string(),
+            default_value: None,
+            description: "Unknown".to_string(),
+            variadic: true,
+        })
+    } else {
+        // Quick fix - If the final arg is not variadic, make it so.
+        // Most of the time, if a function takes a list, it also takes it as multiple arguments instead.
+        let mut final_arg = args.last_mut().unwrap();
+        if !final_arg.variadic {
+            final_arg.variadic = true;
+        }
+    }
 
     args.extend(kwargs);
     args
@@ -476,17 +505,17 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     let create_flags: Vec<&MayaFlagDef> = def
         .flags
         .iter()
-        .filter(|flag| flag.modes.is_empty() || flag.modes.contains(&ParamMode::Create))
+        .filter(|flag| flag.modes.is_empty() || flag.modes.contains(&FlagMode::Create))
         .collect();
     let mut edit_flags: Vec<&MayaFlagDef> = def
         .flags
         .iter()
-        .filter(|flag| flag.modes.contains(&ParamMode::Edit))
+        .filter(|flag| flag.modes.contains(&FlagMode::Edit))
         .collect();
     let query_flags: Vec<&MayaFlagDef> = def
         .flags
         .iter()
-        .filter(|flag| flag.modes.contains(&ParamMode::Query))
+        .filter(|flag| flag.modes.contains(&FlagMode::Query))
         .collect();
 
     //let mut num_overloads = 0;
@@ -531,13 +560,31 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     if !query_flags.is_empty() {
         // This is where things get a little experimental, and I need to test this in the wild.
 
-        for flag in query_flags {
-            // In query mode, the flag's return type is the functions' return type.
-            // And the flag is usually (I think?) changed to a boolean.
+        // In query mode, many of the flags change the return type of the function, but not all.
+        // Some are documented as the type of the flag, some are just 'boolean', and some vary on other conditions.
+        // For now, we only handle overloading the query flags that actually specify a type.
+        // For all other query flags, we lump them into a single overload which returns Any.
 
-            // Also, when using query flags in this way it does not make sense to have more than one,
-            // So I will do an overload for each flag separately.
+        let (query_flags, query_switch_flags): (Vec<&MayaFlagDef>, Vec<&MayaFlagDef>) = query_flags
+            .into_iter()
+            .partition(|flag| flag.type_name == "boolean");
 
+        if query_flags.len() > 0 {
+            let return_type = "Any";
+
+            let mut flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY];
+            flags.extend(&query_flags);
+
+            defs.extend(double_defs(
+                &def.name,
+                &def.params,
+                &flags,
+                return_type,
+                &def.description,
+            ));
+        }
+
+        for flag in query_switch_flags {
             let new_flag = MayaFlagDef {
                 longname: flag.longname.clone(),
                 shortname: flag.shortname.clone(),
@@ -546,7 +593,9 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                 description: flag.description.clone(),
             };
 
-            let flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY, &new_flag];
+            // The flags for this will be a required flag for the 'query switch', plus all the other unknown query flags
+            let mut flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY, &new_flag];
+            flags.extend(&query_flags);
 
             // This is very hacky - just an experiment.
             // If a query flag is described as a boolean, then it probably
@@ -571,6 +620,20 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         }
     }
 
+    if defs.is_empty() {
+        let return_type = def
+            .return_type
+            .as_ref()
+            .map_or(String::from("None"), |s| py_type_from_maya(&s));
+
+        defs.push(fmt_py_def(
+            &def.name,
+            &py_params_from_maya(&def.params, &vec![], FlagNameType::Long),
+            &return_type,
+            "", // &description,
+        ));
+    }
+
     defs
 }
 
@@ -581,20 +644,22 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         static ref SEL_RETURN: Selector = Selector::parse("h2 + table i").unwrap();
         static ref SEL_SYN: Selector = Selector::parse("p#synopsis").unwrap();
         static ref SEL_DESC: Selector = Selector::parse("p#synopsis ~ p").unwrap();
+        static ref RE_TITLE: Regex = Regex::new(r"[a-z,A-Z]+").unwrap();
     }
 
     let html_body: String = fs::read_to_string(filename)?.parse()?;
     let document = scraper::Html::parse_document(&html_body);
 
-    let name: String = document
+    let name = document
         .select(&SEL_NAME)
         .next()
         .ok_or("No title found!")?
         .text()
         .next() // NB: Only getting first bit of text, because anything beyond this is not the name of the func.
         .ok_or("No text found in title!")?
-        .trim()
-        .to_string();
+        .trim();
+
+    let name = RE_TITLE.find(&name).unwrap().as_str().to_string();
 
     let params = parse_synopsis(
         document
@@ -613,12 +678,10 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         None => None,
     };
 
-    // Parse the parameters table
-    let tbody = document
-        .select(&SEL_TABLE)
-        .next()
-        .ok_or("No params table found!")?;
-    let flags = process_params_table(tbody);
+    let flags = match document.select(&SEL_TABLE).next() {
+        Some(table) => process_flags_table(table),
+        None => vec![],
+    };
 
     for param in &params {
         assert!(
@@ -754,5 +817,31 @@ mod tests {
         // assert_eq!(result.params[1].optional, true);
         fmt_func_pys(&result);
         //assert_eq!(s.length() > 0);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_objExists() {
+        let filepath = "./source_docs/2023/CommandsPython/objExists.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "objExists");
+        assert_eq!(result.flags.len(), 0);
+        assert_eq!(result.params[0].type_name, "string");
+        assert_eq!(result.params[0].variadic, false);
+        assert_eq!(result.params[0].optional, false);
+        fmt_func_pys(&result);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_eval() {
+        let filepath = "./source_docs/2023/CommandsPython/eval.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "eval");
+        assert_eq!(result.flags.len(), 0);
+        assert_eq!(result.params[0].type_name, "string");
+        assert_eq!(result.params[0].variadic, false);
+        assert_eq!(result.params[0].optional, false);
+        fmt_func_pys(&result);
     }
 }
