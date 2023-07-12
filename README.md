@@ -1,17 +1,21 @@
 A `maya.cmds` typings generator for Python.
-
 Written in Rust, because why not. It's fun.
 
-Inspired by this Python script:
+# Just give me the types
 
-https://gist.github.com/yamahigashi/da1876765de3c8e5f570a9c57baa45d6
+[maya.cmds typings for Maya 2023](./typings/maya/cmds/__init__.pyi)
+
+# Usage
+
+- Download the documentation for your Maya version, for example: https://download.autodesk.com/akn/2023/maya/autodesk-maya-user-guide-2023.3-en.zip
+- Copy the "CommandsPython" folder from there and into the `./source_docs/2023` folder here.
+- `cargo run`
 
 # Status
 
 This is a work-in-progress and does not yet generate full type definitions.
-The goal of this project is to make use of `Typing.overload` to make many different
-overloads. Each mode, along with the short and long-form flag names, and along with the various
-return types in query mode, will be a different overload.
+
+The main goal of this project is to make use of `Typing.overload` (Available in Python3.9+), such that the return values of functions in query mode return the correct type. This should make Pylance happier for you!
 
 # Limitations
 
