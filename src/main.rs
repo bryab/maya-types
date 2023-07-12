@@ -145,8 +145,13 @@ struct MayaFlagDef {
 struct MayaParamDef {
     /// The native MEL/C type, which will need to be converted into Python
     type_name: String,
-    optional: bool,
-    variadic: bool,
+    mode: ParamMode,
+}
+#[derive(Debug, PartialEq)]
+enum ParamMode {
+    Default,
+    Optional,
+    Variadic,
 }
 
 #[derive(Debug)]
@@ -157,6 +162,54 @@ struct MayaFuncDef {
     return_type: Option<String>,
     params: Vec<MayaParamDef>,
     flags: Vec<MayaFlagDef>,
+    /// The modes that this function supports, such as "query".
+    /// Note that even if there are no flags for this function with a given mode, if the mode is set here,
+    /// Then the function should work in that mode with no flags.
+    modes: Vec<FlagMode>,
+}
+
+impl MayaFuncDef {
+    pub fn new(name: &str) -> Self {
+        MayaFuncDef {
+            description: String::new(),
+            name: name.to_string(),
+            return_type: None,
+            params: vec![],
+            flags: vec![],
+            modes: vec![],
+        }
+    }
+
+    pub fn add_param(&mut self, type_name: &str, mode: ParamMode) {
+        self.params.push(MayaParamDef {
+            type_name: type_name.to_string(),
+            mode,
+        })
+    }
+
+    pub fn add_flag(
+        &mut self,
+        longname: &str,
+        shortname: &str,
+        type_name: &str,
+        modes: Vec<FlagMode>,
+    ) {
+        self.flags.push(MayaFlagDef {
+            longname: longname.to_string(),
+            shortname: shortname.to_string(),
+            type_name: type_name.to_string(),
+            modes,
+            description: String::new(),
+        })
+    }
+
+    pub fn set_modes(&mut self, modes: Vec<FlagMode>) {
+        self.modes = modes;
+    }
+
+    pub fn set_return_type(&mut self, return_type: &str) {
+        self.return_type = Some(return_type.to_string());
+    }
 }
 
 /// Parses the main table describing the parameters of the function
@@ -259,11 +312,15 @@ fn parse_synopsis(synopsis: ElementRef) -> Option<Vec<MayaParamDef>> {
                     false => (type_name.trim().to_string(), false),
                 };
 
-                MayaParamDef {
-                    type_name,
-                    optional,
-                    variadic,
-                }
+                let mode = if variadic {
+                    ParamMode::Variadic
+                } else if optional {
+                    ParamMode::Optional
+                } else {
+                    ParamMode::Default
+                };
+
+                MayaParamDef { type_name, mode }
             })
             //.inspect(|s| println!("{:?}", s))
             .collect(),
@@ -398,17 +455,16 @@ fn py_params_from_maya(
         .iter()
         .map(|param| {
             let type_name = py_type_from_maya(&param.type_name);
-            let (type_name, default_value) = match param.optional {
-                true => {
-                    match default_value_for_type(&type_name) {
-                        Some(default_value) => (type_name.clone(), Some(default_value.to_string())), // FIXME: Clone should be unnecessary here.
-                        None => (
-                            format!("Optional[{}]", &type_name),
-                            Some("None".to_string()),
-                        ),
-                    }
+            let (type_name, default_value) = if param.mode == ParamMode::Optional {
+                match default_value_for_type(&type_name) {
+                    Some(default_value) => (type_name.clone(), Some(default_value.to_string())), // FIXME: Clone should be unnecessary here.
+                    None => (
+                        format!("Optional[{}]", &type_name),
+                        Some("None".to_string()),
+                    ),
                 }
-                false => (type_name, None),
+            } else {
+                (type_name, None)
             };
 
             let mut name = param.type_name.clone();
@@ -422,7 +478,7 @@ fn py_params_from_maya(
                 type_name,
                 default_value,
                 description: String::new(), // FIXME: description should be optional
-                variadic: param.variadic,
+                variadic: param.mode == ParamMode::Variadic,
             }
         })
         .collect();
@@ -444,6 +500,7 @@ fn py_params_from_maya(
         let final_arg = args.last_mut().unwrap();
         if !final_arg.variadic {
             final_arg.variadic = true;
+            final_arg.default_value = None;
         }
     }
 
@@ -504,20 +561,12 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     let create_flags: Vec<&MayaFlagDef> = def
         .flags
         .iter()
-        .filter(|flag| flag.modes.is_empty() || flag.modes.contains(&FlagMode::Create))
+        .filter(|flag| {
+            flag.modes.is_empty()
+                || flag.modes.len() == 1 && *flag.modes.first().unwrap() == FlagMode::Multiuse
+                || flag.modes.contains(&FlagMode::Create)
+        })
         .collect();
-    let mut edit_flags: Vec<&MayaFlagDef> = def
-        .flags
-        .iter()
-        .filter(|flag| flag.modes.contains(&FlagMode::Edit))
-        .collect();
-    let query_flags: Vec<&MayaFlagDef> = def
-        .flags
-        .iter()
-        .filter(|flag| flag.modes.contains(&FlagMode::Query))
-        .collect();
-
-    //let mut num_overloads = 0;
 
     let mut defs: Vec<String> = vec![];
 
@@ -539,7 +588,13 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         );
     }
 
-    if !edit_flags.is_empty() {
+    if def.modes.contains(&FlagMode::Edit) {
+        let mut edit_flags: Vec<&MayaFlagDef> = def
+            .flags
+            .iter()
+            .filter(|flag| flag.modes.contains(&FlagMode::Edit))
+            .collect();
+
         let return_type = "None"; // FIXME: Unsure what return type is in edit mode. Same as create maybe?
 
         edit_flags.insert(0, &FLAG_EDIT);
@@ -556,7 +611,9 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         );
     }
 
-    if !query_flags.is_empty() {
+    if def.modes.contains(&FlagMode::Query) {
+        //let mut num_overloads = 0;
+
         // This is where things get a little experimental, and I need to test this in the wild.
 
         // In query mode, many of the flags change the return type of the function, but not all.
@@ -564,24 +621,24 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         // For now, we only handle overloading the query flags that actually specify a type.
         // For all other query flags, we lump them into a single overload which returns Any.
 
-        let (query_flags, query_switch_flags): (Vec<&MayaFlagDef>, Vec<&MayaFlagDef>) = query_flags
-            .into_iter()
+        let (query_flags, query_switch_flags): (Vec<&MayaFlagDef>, Vec<&MayaFlagDef>) = def
+            .flags
+            .iter()
+            .filter(|flag| flag.modes.contains(&FlagMode::Query))
             .partition(|flag| flag.type_name == "boolean");
 
-        if query_flags.len() > 0 {
-            let return_type = "Any";
+        let return_type = "Any";
 
-            let mut flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY];
-            flags.extend(&query_flags);
+        let mut flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY];
+        flags.extend(&query_flags);
 
-            defs.extend(double_defs(
-                &def.name,
-                &def.params,
-                &flags,
-                return_type,
-                &def.description,
-            ));
-        }
+        defs.extend(double_defs(
+            &def.name,
+            &def.params,
+            &flags,
+            return_type,
+            &def.description,
+        ));
 
         for flag in query_switch_flags {
             let new_flag = MayaFlagDef {
@@ -642,8 +699,10 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         static ref SEL_NAME: Selector = Selector::parse("div#banner td > h1").unwrap();
         static ref SEL_RETURN: Selector = Selector::parse("h2 + table i").unwrap();
         static ref SEL_SYN: Selector = Selector::parse("p#synopsis").unwrap();
-        static ref SEL_DESC: Selector = Selector::parse("p#synopsis ~ p").unwrap();
+        static ref SEL_DESC: Selector = Selector::parse("p#synopsis + p ~ p").unwrap();
+        static ref SEL_MODES_DESC: Selector = Selector::parse("p#synopsis + p").unwrap();
         static ref RE_TITLE: Regex = Regex::new(r"[a-z,A-Z]+").unwrap();
+        static ref RE_MODES: Regex = Regex::new(r"queryable|editable").unwrap();
     }
 
     let html_body: String = fs::read_to_string(filename)?.parse()?;
@@ -672,6 +731,20 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
 
     let description: String = document.select(&SEL_DESC).flat_map(|e| e.text()).collect();
 
+    let modes_description = document
+        .select(&SEL_MODES_DESC)
+        .flat_map(|e| e.text())
+        .collect::<String>();
+
+    let modes: Vec<FlagMode> = RE_MODES
+        .find_iter(&modes_description)
+        .filter_map(|m| match m.as_str() {
+            "queryable" => Some(FlagMode::Query),
+            "editable" => Some(FlagMode::Edit),
+            _ => None,
+        })
+        .collect();
+
     let return_type: Option<String> = match document.select(&SEL_RETURN).next() {
         Some(e) => Some(e.text().next().unwrap().trim().to_string()),
         None => None,
@@ -697,6 +770,7 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         return_type,
         flags,
         params,
+        modes,
     })
 }
 
@@ -706,9 +780,15 @@ fn apply_func_fixes(mut def: MayaFuncDef) -> MayaFuncDef {
     if (def.name == "file") {
         def.params = vec![MayaParamDef {
             type_name: "filename".to_string(),
-            optional: false,
-            variadic: false,
-        }]
+            mode: ParamMode::Default,
+        }];
+
+        let namespace_flag = def
+            .flags
+            .iter_mut()
+            .find(|flag| flag.longname == "namespace")
+            .unwrap();
+        namespace_flag.modes = vec![FlagMode::Query, FlagMode::Create];
     }
     def
 }
@@ -717,60 +797,40 @@ fn add_missing_funcs() -> Vec<MayaFuncDef> {
     // This is just a test of a possible pipeline, which would load
     // Fixes to the documentation from an external file.
 
-    vec![
-        MayaFuncDef {
-            name: "FBXExport".to_string(),
-            params: vec![
-                (MayaParamDef {
-                    type_name: "args".to_string(),
-                    variadic: true,
-                    optional: false,
-                }),
-            ],
-            description: String::new(),
-            return_type: Some("Any".to_string()),
-            flags: vec![],
-        },
-        MayaFuncDef {
-            name: "AbcExport".to_string(),
-            params: vec![
-                (MayaParamDef {
-                    type_name: "args".to_string(),
-                    variadic: true,
-                    optional: false,
-                }),
-            ],
-            description: String::new(),
-            return_type: Some("Any".to_string()),
-            flags: vec![],
-        },
-        MayaFuncDef {
-            name: "houdiniAsset".to_string(),
-            params: vec![
-                (MayaParamDef {
-                    type_name: "args".to_string(),
-                    variadic: true,
-                    optional: false,
-                }),
-            ],
-            description: String::new(),
-            return_type: Some("Any".to_string()),
-            flags: vec![],
-        },
-        MayaFuncDef {
-            name: "invertShape".to_string(),
-            params: vec![
-                (MayaParamDef {
-                    type_name: "args".to_string(),
-                    variadic: true,
-                    optional: false,
-                }),
-            ],
-            description: String::new(),
-            return_type: Some("string".to_string()),
-            flags: vec![],
-        },
-    ]
+    let mut defs: Vec<MayaFuncDef> = vec![];
+    let mut f = MayaFuncDef::new("FBXExport");
+    f.add_param("string", ParamMode::Default);
+    f.set_return_type("any");
+    defs.push(f);
+
+    let mut f = MayaFuncDef::new("AbcExport");
+    f.add_param("string", ParamMode::Default);
+    f.add_flag("jobArg", "j", "string", vec![FlagMode::Multiuse]);
+    f.add_flag("preRollStartFrame", "prs", "double", vec![]);
+    f.add_flag("dontSkipUnwrittenFrames", "duf", "boolean", vec![]);
+    f.set_return_type("any");
+    defs.push(f);
+
+    let mut f = MayaFuncDef::new("houdiniAsset");
+    f.add_param("string", ParamMode::Default);
+    f.add_flag("cookMessages", "cm", "string", vec![]);
+    f.add_flag("loadAsset", "la", "string", vec![]);
+    f.add_flag("listAssets", "ls", "string", vec![]);
+    f.add_flag("reloadAsset", "rl", "string", vec![]);
+    f.add_flag("resetSimulation", "rs", "string", vec![]);
+    f.add_flag("syncAttributes", "sa", "bool", vec![]);
+    f.add_flag("syncHidden", "shi", "boolean", vec![]);
+    f.add_flag("syncOutputs", "so", "boolean", vec![]);
+    f.add_flag("syncTemplatedGeos", "stm", "boolean", vec![]);
+    f.add_flag("syncName", "syn", "boolean", vec![]);
+    defs.push(f);
+
+    let mut f = MayaFuncDef::new("invertShape");
+    f.add_param("string", ParamMode::Default);
+    f.add_param("string", ParamMode::Default);
+    defs.push(f);
+
+    defs
 }
 /// Parses all the files in a Maya documentation folder, producing a Vec of the Python defintion of each
 fn parse_all_maya_docs<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
@@ -820,8 +880,7 @@ mod tests {
         assert_eq!(result.flags.len(), 33);
         assert_eq!(result.params.len(), 1);
         assert_eq!(result.params[0].type_name, "objects");
-        assert_eq!(result.params[0].variadic, true);
-        assert_eq!(result.params[0].optional, true);
+        assert_eq!(result.params[0].mode, ParamMode::Variadic);
         fmt_func_pys(&result);
         // assert_eq!(s.length() > 0);
     }
@@ -834,8 +893,7 @@ mod tests {
         assert_eq!(result.flags.len(), 14);
         assert_eq!(result.params.len(), 1);
         assert_eq!(result.params[0].type_name, "objects");
-        assert_eq!(result.params[0].variadic, false);
-        assert_eq!(result.params[0].optional, false);
+        assert_eq!(result.params[0].mode, ParamMode::Default);
         fmt_func_pys(&result);
         // assert_eq!(s.length() > 0);
     }
@@ -848,8 +906,7 @@ mod tests {
         assert_eq!(result.flags.len(), 21);
         assert_eq!(result.params.len(), 1);
         assert_eq!(result.params[0].type_name, "objects");
-        assert_eq!(result.params[0].variadic, false);
-        assert_eq!(result.params[0].optional, false);
+        assert_eq!(result.params[0].mode, ParamMode::Default);
         fmt_func_pys(&result);
         //assert_eq!(s.length() > 0);
     }
@@ -862,11 +919,9 @@ mod tests {
         assert_eq!(result.flags.len(), 6);
         assert_eq!(result.params.len(), 2);
         assert_eq!(result.params[0].type_name, "target");
-        assert_eq!(result.params[0].variadic, true);
-        assert_eq!(result.params[0].optional, true);
+        assert_eq!(result.params[0].mode, ParamMode::Variadic);
         assert_eq!(result.params[1].type_name, "object");
-        assert_eq!(result.params[1].variadic, false);
-        assert_eq!(result.params[1].optional, true);
+        assert_eq!(result.params[1].mode, ParamMode::Optional);
         fmt_func_pys(&result);
         //assert_eq!(s.length() > 0);
     }
@@ -880,11 +935,9 @@ mod tests {
         assert_eq!(result.flags.len(), 11);
         //assert_eq!(result.params.len(), 3);
         assert_eq!(result.params[0].type_name, "curve");
-        assert_eq!(result.params[0].variadic, false);
-        assert_eq!(result.params[0].optional, false);
+        assert_eq!(result.params[0].mode, ParamMode::Default);
         assert_eq!(result.params[1].type_name, "curve");
-        assert_eq!(result.params[1].variadic, false);
-        assert_eq!(result.params[1].optional, true);
+        assert_eq!(result.params[1].mode, ParamMode::Optional);
         // assert_eq!(result.params[1].type_name, "curve__");
         // assert_eq!(result.params[1].variadic, true);
         // assert_eq!(result.params[1].optional, true);
@@ -900,8 +953,7 @@ mod tests {
         assert_eq!(result.name, "objExists");
         assert_eq!(result.flags.len(), 0);
         assert_eq!(result.params[0].type_name, "string");
-        assert_eq!(result.params[0].variadic, false);
-        assert_eq!(result.params[0].optional, false);
+        assert_eq!(result.params[0].mode, ParamMode::Default);
         fmt_func_pys(&result);
     }
 
@@ -913,8 +965,7 @@ mod tests {
         assert_eq!(result.name, "eval");
         assert_eq!(result.flags.len(), 0);
         assert_eq!(result.params[0].type_name, "string");
-        assert_eq!(result.params[0].variadic, false);
-        assert_eq!(result.params[0].optional, false);
+        assert_eq!(result.params[0].mode, ParamMode::Default);
         fmt_func_pys(&result);
     }
 
@@ -926,8 +977,17 @@ mod tests {
         assert_eq!(result.name, "group");
         assert_eq!(result.flags.len(), 7);
         assert_eq!(result.params[0].type_name, "objects");
-        assert_eq!(result.params[0].variadic, true);
-        assert_eq!(result.params[0].optional, true);
+        assert_eq!(result.params[0].mode, ParamMode::Variadic);
+        fmt_func_pys(&result);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_currentTime() {
+        let filepath = "./source_docs/2023/CommandsPython/currentTime.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "currentTime");
+        assert!(result.modes.contains(&FlagMode::Query));
         fmt_func_pys(&result);
     }
 }
