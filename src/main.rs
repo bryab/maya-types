@@ -218,6 +218,8 @@ fn process_flags_table(table: ElementRef) -> Vec<MayaFlagDef> {
         static ref RE_PARAM: Regex = Regex::new(r"(\w+)\((\w+)\)").unwrap();
         static ref SEL_ROW: Selector = Selector::parse("body > table > tbody > tr").unwrap();
         static ref SEL_COL: Selector = Selector::parse("td").unwrap();
+        static ref SEL_DESC: Selector =
+            Selector::parse("td > table > tbody > tr > td + td").unwrap();
         static ref SEL_CODE: Selector = Selector::parse("code").unwrap();
         static ref SEL_IMG: Selector = Selector::parse("img").unwrap();
     }
@@ -258,11 +260,11 @@ fn process_flags_table(table: ElementRef) -> Vec<MayaFlagDef> {
                 })
                 .collect();
             let description: String = row2
-                .select(&SEL_COL)
+                .select(&SEL_DESC)
                 .flat_map(|code| code.text())
-                .collect::<String>()
-                .trim()
-                .to_string();
+                .map(|text| text.trim().replace("\n", " "))
+                .collect::<String>();
+
             Some(MayaFlagDef {
                 longname,
                 shortname,
@@ -285,8 +287,6 @@ fn parse_synopsis(synopsis: ElementRef) -> Option<Vec<MayaParamDef>> {
     let positional_param_text = RE_POSITIONAL_PARAMS
         .captures(&synopsis_text)
         .and_then(|c| Some(c.get(1).unwrap().as_str().trim().to_string()))?;
-
-    //println!("{}", positional_param_text);
 
     // The syntax of the positional parameters is a bit odd, so I am parsing it in an odd way.
     // I just find where the 'optional' begins first (first bracket)
@@ -381,9 +381,23 @@ fn fmt_signature(params: &Vec<PyParamDef>) -> String {
 
 fn fmt_py_def(name: &str, params: &Vec<PyParamDef>, type_name: &str, description: &str) -> String {
     let signature = fmt_signature(params);
+
     if description.is_empty() {
         format!("def {}({}) -> {}: ...", name, &signature, type_name)
     } else {
+        let param_docstring: String = params
+            .iter()
+            .map(|param| {
+                format!(
+                    "\n:param {}: {}",
+                    param.name,
+                    param.description.replace("\n", "; ")
+                )
+            })
+            .collect();
+
+        let description = format!("{}{}", description, param_docstring);
+
         format!(
             "def {}({}) -> {}:\n\t\"\"\"\n\t{}\n\t\"\"\"\n\t...",
             name,
@@ -393,10 +407,6 @@ fn fmt_py_def(name: &str, params: &Vec<PyParamDef>, type_name: &str, description
         )
     }
 }
-
-// fn fmt_py_def(name: &str, signature: &str, return_type: &str) -> String {
-//     format!("def {}({}) -> {}: ...", name, &signature, return_type,)
-// }
 
 struct PyParamDef {
     name: String,
@@ -436,7 +446,7 @@ fn py_params_from_maya(
             }
             param_names.borrow_mut().insert(name.clone());
 
-            let type_name = if (flag.modes.contains(&FlagMode::Multiuse)) {
+            let type_name = if flag.modes.contains(&FlagMode::Multiuse) {
                 format!("{0} | list[{0}] | Tuple[{0},...]", &type_name)
             } else {
                 type_name.to_string()
@@ -520,27 +530,18 @@ fn double_defs(
             &name,
             &py_params_from_maya(&params, &flags, FlagNameType::Short),
             &return_type,
-            "", //&description, // FIXME: disabling description temporarily as it greatly increases output size
+            "", //&description, // NB: I've decided arbitrarily to remove the description from the 'short' mode, just to save space in the file.
         ),
         fmt_py_def(
             &name,
             &py_params_from_maya(&params, &flags, FlagNameType::Long),
             &return_type,
-            "", // &description,
+            &description,
         ),
     ]
 }
 /// Formats a FunctionDef into one or multiple type definitions
 fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
-    // This function is a mess and needs a rethink.
-    // Just wanted to get the functionality down first
-    // match &def.params {
-    //     Some(params) => println!("{}: {:?}", def.name, params),
-    //     None => (),
-    // };
-
-    //println!("Function name: {}", &def.name);
-
     lazy_static! {
         static ref FLAG_EDIT: MayaFlagDef = MayaFlagDef {
             shortname: String::from("e"),
@@ -646,7 +647,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                 shortname: flag.shortname.clone(),
                 type_name: String::from("boolean"),
                 modes: vec![],
-                description: flag.description.clone(),
+                description: String::new(), // NB: I've decided arbitrarily to remove the description from the various query mode overloads
             };
 
             // The flags for this will be a required flag for the 'query switch', plus all the other unknown query flags
@@ -669,7 +670,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                     &def.params,
                     &flags,
                     &return_type,
-                    &format!("[Query Mode: {}]\n{}", flag.longname, flag.description),
+                    "", // NB: I've decided arbitrarily to remove the description from the various query mode overloads, just to save space in the file. &format!("[Query Mode: {}]\n{}", flag.longname, flag.description),
                 )
                 .into_iter(),
             );
@@ -702,7 +703,8 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         static ref SEL_DESC: Selector = Selector::parse("p#synopsis + p ~ p").unwrap();
         static ref SEL_MODES_DESC: Selector = Selector::parse("p#synopsis + p").unwrap();
         static ref RE_TITLE: Regex = Regex::new(r"[a-z,A-Z]+").unwrap();
-        static ref RE_MODES: Regex = Regex::new(r"queryable|editable").unwrap();
+        static ref RE_MODES: Regex = Regex::new(r"[^T] (queryable|editable)").unwrap();
+        static ref RE_EXTRA_WHITESPACE: Regex = Regex::new(r"\n[\n\t ]+").unwrap();
     }
 
     let html_body: String = fs::read_to_string(filename)?.parse()?;
@@ -729,7 +731,14 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
 
     //assert!(positional_params.len() > 0);
 
-    let description: String = document.select(&SEL_DESC).flat_map(|e| e.text()).collect();
+    let description = document
+        .select(&SEL_DESC)
+        .flat_map(|e| e.text())
+        .collect::<String>();
+
+    let description = RE_EXTRA_WHITESPACE
+        .replace_all(&description.trim(), "\n")
+        .to_string();
 
     let modes_description = document
         .select(&SEL_MODES_DESC)
@@ -737,7 +746,8 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         .collect::<String>();
 
     let modes: Vec<FlagMode> = RE_MODES
-        .find_iter(&modes_description)
+        .captures_iter(&modes_description)
+        .filter_map(|c| c.get(1))
         .filter_map(|m| match m.as_str() {
             "queryable" => Some(FlagMode::Query),
             "editable" => Some(FlagMode::Edit),
@@ -777,7 +787,7 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
 fn apply_func_fixes(mut def: MayaFuncDef) -> MayaFuncDef {
     // This is just a test of a possible pipeline, which would load
     // Fixes to the documentation from an external file.
-    if (def.name == "file") {
+    if def.name == "file" {
         def.params = vec![MayaParamDef {
             type_name: "filename".to_string(),
             mode: ParamMode::Default,
@@ -975,9 +985,13 @@ mod tests {
         let filepath = "./source_docs/2023/CommandsPython/group.html";
         let result = parse_maya_function_doc(&filepath).unwrap();
         assert_eq!(result.name, "group");
+        assert!(!result.modes.contains(&FlagMode::Query));
+        assert_eq!(result.description, "If the -em flag is specified, then an empty group (with no\nobjects) is created.\nIf the -w flag is specified then the new group is placed under the\nworld, otherwise if -p is specified it is placed under the\nspecified node. If neither -w or -p is specified the new group is\nplaced under the lowest common group they have in common. (or the\nworld if no such group exists)\nIf an object is grouped with another object that has the same name\nthen one of the objects will be renamed by this command.");
         assert_eq!(result.flags.len(), 7);
         assert_eq!(result.params[0].type_name, "objects");
         assert_eq!(result.params[0].mode, ParamMode::Variadic);
+        assert_eq!(result.flags[0].longname, "absolute");
+        assert_eq!(result.flags[0].description, "preserve existing world object transformations (overall object transformation is preserved by modifying the objects local transformation) [default]");
         fmt_func_pys(&result);
     }
 
