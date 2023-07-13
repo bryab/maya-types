@@ -185,13 +185,18 @@ enum ParamMode {
     Optional,
     Variadic,
 }
+#[derive(Debug, PartialEq)]
+struct ReturnType {
+    name: String,
+    description: String,
+}
 
 #[derive(Debug)]
 /// FunctionDef contains all the useful data parsed from a function in the Maya documentation
 struct MayaFuncDef {
     description: String,
     name: String,
-    return_type: Option<String>,
+    return_type: Vec<ReturnType>,
     params: Vec<MayaParamDef>,
     flags: Vec<MayaFlagDef>,
     /// The modes that this function supports, such as "query".
@@ -205,7 +210,7 @@ impl MayaFuncDef {
         MayaFuncDef {
             description: String::new(),
             name: name.to_string(),
-            return_type: None,
+            return_type: vec![],
             params: vec![],
             flags: vec![],
             modes: vec![],
@@ -240,7 +245,10 @@ impl MayaFuncDef {
     }
 
     pub fn set_return_type(&mut self, return_type: &str) {
-        self.return_type = Some(return_type.to_string());
+        self.return_type = vec![ReturnType {
+            name: return_type.to_string(),
+            description: String::new(),
+        }];
     }
 }
 
@@ -583,6 +591,17 @@ fn double_defs(
     }
     defs
 }
+
+fn fmt_return_type(return_types: &Vec<ReturnType>) -> String {
+    if return_types.is_empty() {
+        String::from("None")
+    } else {
+        return_types
+            .iter()
+            .map(|t| py_type_from_maya(&t.name))
+            .join(" | ")
+    }
+}
 /// Formats a FunctionDef into one or multiple type definitions
 fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     lazy_static! {
@@ -617,10 +636,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     let mut defs: Vec<String> = vec![];
 
     if !create_flags.is_empty() {
-        let return_type = def
-            .return_type
-            .as_ref()
-            .map_or(String::from("None"), |s| py_type_from_maya(&s));
+        let return_type = fmt_return_type(&def.return_type);
 
         defs.extend(
             double_defs(
@@ -735,10 +751,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
     }
 
     if defs.is_empty() {
-        let return_type = def
-            .return_type
-            .as_ref()
-            .map_or(String::from("None"), |s| py_type_from_maya(&s));
+        let return_type = fmt_return_type(&def.return_type);
 
         defs.push(fmt_py_def(
             &def.name,
@@ -755,7 +768,9 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
     lazy_static! {
         static ref SEL_TABLE: Selector = Selector::parse("a ~ table").unwrap();
         static ref SEL_NAME: Selector = Selector::parse("div#banner td > h1").unwrap();
-        static ref SEL_RETURN: Selector = Selector::parse("h2 + table i").unwrap();
+        static ref SEL_RETURN: Selector = Selector::parse("h2 + table tr").unwrap();
+        static ref SEL_RETURN_NAME: Selector = Selector::parse("td > i").unwrap();
+        static ref SEL_RETURN_DESC: Selector = Selector::parse("td + td").unwrap();
         static ref SEL_SYN: Selector = Selector::parse("p#synopsis").unwrap();
         static ref SEL_DESC: Selector = Selector::parse("p#synopsis + p ~ p").unwrap();
         static ref SEL_MODES_DESC: Selector = Selector::parse("p#synopsis + p").unwrap();
@@ -812,10 +827,27 @@ fn parse_maya_function_doc<P: AsRef<Path>>(filename: P) -> Result<MayaFuncDef, B
         })
         .collect();
 
-    let return_type: Option<String> = match document.select(&SEL_RETURN).next() {
-        Some(e) => Some(e.text().next().unwrap().trim().to_string()),
-        None => None,
-    };
+    let return_type = document
+        .select(&SEL_RETURN)
+        .filter_map(|tr| {
+            Some(ReturnType {
+                name: tr
+                    .select(&SEL_RETURN_NAME)
+                    .next()?
+                    .text()
+                    .next()?
+                    .trim()
+                    .to_string(),
+                description: tr
+                    .select(&SEL_RETURN_DESC)
+                    .next()?
+                    .text()
+                    .next()?
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect();
 
     let flags = match document.select(&SEL_TABLE).next() {
         Some(table) => process_flags_table(table),
@@ -1059,6 +1091,25 @@ mod tests {
         let result = parse_maya_function_doc(&filepath).unwrap();
         assert_eq!(result.name, "currentTime");
         assert!(result.modes.contains(&FlagMode::Query));
+        fmt_func_pys(&result);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_connectionInfo() {
+        let filepath = "./source_docs/2023/CommandsPython/connectionInfo.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        assert_eq!(result.name, "connectionInfo");
+        assert_eq!(result.return_type[0].name, "boolean");
+        assert_eq!(
+            result.return_type[0].description,
+            "When asking for a property, depending on the flags used."
+        );
+        assert_eq!(result.return_type[1].name, "string");
+        assert_eq!(
+            result.return_type[1].description,
+            "When asking for a plug name."
+        );
         fmt_func_pys(&result);
     }
 }
