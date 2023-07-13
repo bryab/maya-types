@@ -111,17 +111,18 @@ fn py_type_from_maya_simple(type_name: &str) -> &str {
     }
     match type_name.to_lowercase().as_str() {
         "int" | "int64" | "uint" => "int",
-        "string" | "node" | "name" | "target" | "script" | "selectionitem" => "Text",
         "boolean" => "bool",
         "float" | "angle" | "double" | "time" | "linear" => "float",
         "floatrange" => "Tuple[float,float]",
         "timerange" => "Tuple[float,float]",
         "any" => "Any",
-        "filename" | "message" | "subd" | "stringstring" | "editorname" | "context"
-        | "groupname" | "surfaceisoparm" | "imagename" | "attribute" | "contextname"
-        | "panelname" | "curve" | "surface" | "poly" | "dagobject" | "camera"
-        | "animatedobject" | "targetlist" | "attributelist" | "object" | "objects"
-        | "selectionlist" => "Text | list[Text] | Tuple[Text, ...]",
+        "string" | "node" | "name" | "target" | "script" | "selectionitem" | "filename"
+        | "message" | "subd" | "stringstring" | "editorname" | "context" | "groupname"
+        | "surfaceisoparm" | "imagename" | "attribute" | "contextname" | "panelname" | "curve"
+        | "surface" | "poly" | "dagobject" | "camera" | "animatedobject" | "targetlist"
+        | "attributelist" | "object" | "objects" | "selectionlist" => {
+            "Text | list[Text] | Tuple[Text, ...]"
+        }
         _ => {
             println!("Unknown type: {type_name}");
             "Any"
@@ -852,7 +853,7 @@ fn apply_func_fixes(mut def: MayaFuncDef) -> MayaFuncDef {
         let namespace_flag = def
             .flags
             .iter_mut()
-            .find(|flag| flag.longname == "namespace")
+            .find(|flag| ["namespace", "reference"].contains(&flag.longname.as_str()))
             .unwrap();
         namespace_flag.modes = vec![FlagMode::Query, FlagMode::Create];
     }
