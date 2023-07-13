@@ -114,13 +114,12 @@ fn py_type_from_maya_simple(type_name: &str) -> &str {
         "floatrange" => "Tuple[float,float]",
         "timerange" => "Tuple[float,float]",
         "any" => "Any",
-        "string" | "node" | "name" | "target" | "script" | "selectionitem" | "filename"
-        | "message" | "subd" | "stringstring" | "editorname" | "context" | "groupname"
-        | "surfaceisoparm" | "imagename" | "attribute" | "contextname" | "panelname" | "curve"
-        | "surface" | "poly" | "dagobject" | "camera" | "animatedobject" | "targetlist"
-        | "attributelist" | "object" | "objects" | "selectionlist" => {
-            "Text | list[Text] | Tuple[Text, ...]"
-        }
+        "string" | "script" | "name" => "Text",
+        "node" | "target" | "selectionitem" | "filename" | "message" | "subd" | "stringstring"
+        | "editorname" | "context" | "groupname" | "surfaceisoparm" | "imagename" | "attribute"
+        | "contextname" | "panelname" | "curve" | "surface" | "poly" | "dagobject" | "camera"
+        | "animatedobject" | "targetlist" | "attributelist" | "object" | "objects"
+        | "selectionlist" => "Text | list[Text] | Tuple[Text, ...]",
         _ => {
             println!("Unknown type: {type_name}");
             "Any"
@@ -597,6 +596,7 @@ fn fmt_return_type(return_types: &Vec<ReturnType>) -> String {
         return_types
             .iter()
             .map(|t| py_type_from_maya(&t.name))
+            .unique()
             .join(" | ")
     }
 }
