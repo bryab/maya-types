@@ -1,5 +1,6 @@
 use itertools::Itertools;
 use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use scraper::{self, ElementRef, Selector};
@@ -11,6 +12,36 @@ use std::io::prelude::Write;
 use std::iter;
 use std::path::Path;
 use std::path::PathBuf;
+use std::{collections::HashMap, sync::Mutex};
+
+use clap::{Parser, ValueEnum};
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Amount of docstrings generation
+    #[arg(default_value_t= DescriptionLevel::Default)]
+    #[arg(short, long, value_enum)]
+    desclevel: DescriptionLevel,
+    /// Include short-form flag overloads of all functions
+    #[arg(short, long, default_value_t = false)]
+    short: bool,
+}
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum DescriptionLevel {
+    /// Do not write any docstrings at all
+    None,
+    /// Only write docstrings for "create" mode with longform flags
+    Minimal,
+    /// Only write docstrings for "create" and "edit" mode with longform flags
+    Default,
+    /// Write docstrings for all functions with longform flags
+    Long,
+    /// Write docstrings for all functions
+    All,
+}
+static CONFIG: Lazy<Mutex<Cli>> = Lazy::new(|| Mutex::new(Cli::parse()));
 
 #[derive(Debug, PartialEq)]
 enum FlagMode {
@@ -487,7 +518,7 @@ fn py_params_from_maya(
                 name,
                 type_name,
                 default_value,
-                description: String::new(), // FIXME: description should be optional
+                description: String::new(), // There's no description for positional parameters in the docs.
                 variadic: param.mode == ParamMode::Variadic,
             }
         })
@@ -525,20 +556,31 @@ fn double_defs(
     return_type: &str,
     description: &str,
 ) -> Vec<String> {
-    vec![
-        fmt_py_def(
+    let config = CONFIG.lock().unwrap();
+    let desclevel = config.desclevel;
+    let do_short = config.short;
+    let mut defs = vec![fmt_py_def(
+        &name,
+        &py_params_from_maya(&params, &flags, FlagNameType::Long),
+        &return_type,
+        match desclevel {
+            DescriptionLevel::None => "",
+            _ => &description,
+        },
+    )];
+
+    if do_short {
+        defs.push(fmt_py_def(
             &name,
             &py_params_from_maya(&params, &flags, FlagNameType::Short),
             &return_type,
-            "", //&description, // NB: I've decided arbitrarily to remove the description from the 'short' mode, just to save space in the file.
-        ),
-        fmt_py_def(
-            &name,
-            &py_params_from_maya(&params, &flags, FlagNameType::Long),
-            &return_type,
-            &description,
-        ),
-    ]
+            match desclevel {
+                DescriptionLevel::All => &description,
+                _ => "",
+            },
+        ));
+    }
+    defs
 }
 /// Formats a FunctionDef into one or multiple type definitions
 fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
@@ -558,6 +600,8 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             description: String::from("Enable Query mode"),
         };
     }
+
+    let desclevel = CONFIG.lock().unwrap().desclevel;
 
     let create_flags: Vec<&MayaFlagDef> = def
         .flags
@@ -606,7 +650,10 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                 &def.params,
                 &edit_flags,
                 &return_type,
-                &def.description,
+                match desclevel {
+                    DescriptionLevel::Default | DescriptionLevel::All => &def.description,
+                    _ => "",
+                },
             )
             .into_iter(),
         );
@@ -638,7 +685,10 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             &def.params,
             &flags,
             return_type,
-            &def.description,
+            match desclevel {
+                DescriptionLevel::All | DescriptionLevel::Long => &def.description,
+                _ => "",
+            },
         ));
 
         for flag in query_switch_flags {
@@ -647,7 +697,10 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                 shortname: flag.shortname.clone(),
                 type_name: String::from("boolean"),
                 modes: vec![],
-                description: String::new(), // NB: I've decided arbitrarily to remove the description from the various query mode overloads
+                description: match desclevel {
+                    DescriptionLevel::All | DescriptionLevel::Long => flag.description.clone(),
+                    _ => String::new(),
+                },
             };
 
             // The flags for this will be a required flag for the 'query switch', plus all the other unknown query flags
@@ -670,7 +723,10 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                     &def.params,
                     &flags,
                     &return_type,
-                    "", // NB: I've decided arbitrarily to remove the description from the various query mode overloads, just to save space in the file. &format!("[Query Mode: {}]\n{}", flag.longname, flag.description),
+                    match desclevel {
+                        DescriptionLevel::All | DescriptionLevel::Long => &flag.description,
+                        _ => "",
+                    },
                 )
                 .into_iter(),
             );
@@ -687,7 +743,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             &def.name,
             &py_params_from_maya(&def.params, &vec![], FlagNameType::Long),
             &return_type,
-            "", // &description,
+            &def.description,
         ));
     }
 
