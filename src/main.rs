@@ -21,7 +21,7 @@ use clap::{Parser, ValueEnum};
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Amount of docstrings generation
-    #[arg(default_value_t= DescriptionLevel::Default)]
+    #[arg(default_value_t= DescriptionLevel::All)]
     #[arg(short, long, value_enum)]
     desclevel: DescriptionLevel,
     /// Include short-form flag overloads of all functions
@@ -34,8 +34,6 @@ enum DescriptionLevel {
     None,
     /// Only write docstrings for "create" mode with longform flags
     Minimal,
-    /// Only write docstrings for "create" and "edit" mode with longform flags
-    Default,
     /// Write docstrings for all functions with longform flags
     Long,
     /// Write docstrings for all functions
@@ -374,7 +372,7 @@ fn fmt_func_py(def: MayaFuncDef) -> String {
     } else if defs.len() == 1 {
         defs[0].clone() // FIXME: Surely I can move this String out somehow?
     } else {
-        format!("\n@overload\n{0}", defs.join("\n@overload\n"))
+        format!("@overload\n{0}", defs.join("\n@overload\n"))
     }
 }
 
@@ -668,7 +666,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                 &edit_flags,
                 &return_type,
                 match desclevel {
-                    DescriptionLevel::Default | DescriptionLevel::All => &def.description,
+                    DescriptionLevel::All => &def.description,
                     _ => "",
                 },
             )
