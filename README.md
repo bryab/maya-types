@@ -9,7 +9,9 @@ Written in Rust, because why not. It's fun.
 
 - Download the documentation for your Maya version, for example: https://download.autodesk.com/akn/2023/maya/autodesk-maya-user-guide-2023.3-en.zip
 - Copy the "CommandsPython" folder from there and into the `./source_docs/2023` folder here.
-- `cargo run`
+- To generate typings with the default settings (no short-form, limited docstrings): `cargo run`
+- To generate typings with maximum settings: `cargo run -- -d all -s`
+- To see other options: `cargo run -- --help`
 
 # Status
 
