@@ -50,7 +50,7 @@ enum FlagMode {
 }
 
 /// Convert a MEL type to a Python type, accounting for container types as well.
-fn py_type_from_maya(type_name: &str) -> String {
+fn py_type_from_maya(type_name: &str, is_return_type: bool) -> String {
     lazy_static! {
         static ref RE_ARRAY: Regex = Regex::new(r"(\w+)\[\]").unwrap();
         static ref RE_TUPLE_TYPED: Regex = Regex::new(r"(\w+)\[(\d)\]").unwrap();
@@ -64,7 +64,10 @@ fn py_type_from_maya(type_name: &str) -> String {
             .unwrap()
             .as_str();
         //assert!(!type_name.is_empty());
-        format!("list[{}]", py_type_from_maya_simple(type_name))
+        format!(
+            "list[{}]",
+            py_type_from_maya_simple(type_name, is_return_type)
+        )
     } else if RE_TUPLE_TYPED.is_match(type_name) {
         let (_, type_name, tuple_length) = RE_TUPLE_TYPED
             .captures(&type_name)
@@ -74,7 +77,7 @@ fn py_type_from_maya(type_name: &str) -> String {
             .next_tuple()
             .unwrap();
         //assert!(!type_name.is_empty());
-        let type_name = py_type_from_maya_simple(&type_name);
+        let type_name = py_type_from_maya_simple(&type_name, is_return_type);
         let tuple_length = tuple_length.parse::<usize>().unwrap();
 
         format!(
@@ -94,32 +97,47 @@ fn py_type_from_maya(type_name: &str) -> String {
                     panic!("Empty type produced from: {}", type_name);
                 }
             })
-            .map(|s| py_type_from_maya_simple(s).to_string())
+            .map(|s| py_type_from_maya_simple(s, is_return_type).to_string())
             .collect();
 
         format!("Tuple[{}]", type_names.join(", "))
     } else {
-        String::from(py_type_from_maya_simple(type_name))
+        String::from(py_type_from_maya_simple(type_name, is_return_type))
     }
 }
 /// Convert a Maya type to a Python type - only simple non-container types.
-fn py_type_from_maya_simple(type_name: &str) -> &str {
+fn py_type_from_maya_simple(type_name: &str, is_return_type: bool) -> &str {
     if type_name.is_empty() {
         panic!("Type name empty!");
     }
     match type_name.to_lowercase().as_str() {
         "int" | "int64" | "uint" => "int",
-        "boolean" => "bool",
+        "boolean" => {
+            // It seems that for flags and parameters, any boolean parameter accepts, at least, a boolean or 0/1 integer.
+            // However, if this is a return type, we don't want to return a union, as this adds ambiguity and makes Pylance very sad.
+            if is_return_type {
+                "bool"
+            } else {
+                "bool | Literal[0,1]"
+            }
+        }
         "float" | "angle" | "double" | "time" | "linear" => "float",
         "floatrange" => "Tuple[float,float]",
         "timerange" => "Tuple[float,float]",
         "any" => "Any",
-        "string" | "script" | "name" => "Text",
-        "node" | "target" | "selectionitem" | "filename" | "message" | "subd" | "stringstring"
-        | "editorname" | "context" | "groupname" | "surfaceisoparm" | "imagename" | "attribute"
-        | "contextname" | "panelname" | "curve" | "surface" | "poly" | "dagobject" | "camera"
-        | "animatedobject" | "targetlist" | "attributelist" | "object" | "objects"
-        | "selectionlist" => "Text | list[Text] | Tuple[Text, ...]",
+        "string" | "script" | "name" | "node" | "target" | "selectionitem" | "filename"
+        | "message" | "subd" | "stringstring" | "editorname" | "context" | "groupname"
+        | "surfaceisoparm" | "imagename" | "attribute" | "contextname" | "panelname" | "curve"
+        | "surface" | "poly" | "dagobject" | "camera" | "animatedobject" | "targetlist"
+        | "attributelist" | "object" | "objects" | "selectionlist" => {
+            // It seems that for flags and parameters, any text parameter accepts a string, a list of strings, or a tuple of strings
+            // However, if this is a return type, we don't want to return a union, as this adds ambiguity and makes Pylance very sad.
+            if is_return_type {
+                "Text"
+            } else {
+                "Text | list[Text] | Tuple[Text, ...]"
+            }
+        }
         _ => {
             println!("Unknown type: {type_name}");
             "Any"
@@ -130,13 +148,13 @@ fn py_type_from_maya_simple(type_name: &str) -> &str {
 /// Some query flags don't specify the return type in a way that is easy to parse.
 /// Here I attempt to deduce the type from the name of the parameter.
 // This is rather questionable - it probably would take a great bit of work to add all the necessary values here.
-fn py_type_from_flag_name(name: &str) -> Option<&str> {
-    let type_name = match name {
-        "boundingBox" => "Tuple[float,float,float,float,float,float]",
-        _ => return None,
-    };
-    Some(type_name)
-}
+// fn py_type_from_flag_name(name: &str) -> Option<&str> {
+//     let type_name = match name {
+//         "boundingBox" => "Tuple[float,float,float,float,float,float]",
+//         _ => return None,
+//     };
+//     Some(type_name)
+// }
 
 /// In order to handle optional flags in functions, we must provide the default value for each flag.
 /// Unfortunately this is not known from the documentation.  The standard procedure here in Python
@@ -167,6 +185,8 @@ struct MayaFlagDef {
     /// As they operate completely differently in each mode.
     pub modes: Vec<FlagMode>,
     pub description: String,
+    /// This is used to label the main switch flags (query, edit) so that they are required in their overloads.
+    pub required: bool,
 }
 
 /// ParamDef describes a positional parameter as opposed to a flag.
@@ -234,6 +254,7 @@ impl MayaFuncDef {
             type_name: type_name.to_string(),
             modes,
             description: String::new(),
+            required: false,
         })
     }
 
@@ -308,6 +329,7 @@ fn process_flags_table(table: ElementRef) -> Vec<MayaFlagDef> {
                 type_name,
                 description,
                 modes,
+                required: false,
             })
         })
         .collect()
@@ -464,10 +486,17 @@ fn py_params_from_maya(
         .iter()
         .map(|flag| {
             assert!(!&flag.type_name.is_empty());
-            let type_name = py_type_from_maya(&flag.type_name);
-            let (type_name, default_value) = match default_value_for_type(&type_name) {
-                Some(default_value) => (type_name.clone(), default_value), // FIXME: Clone should be unnecessary here.
-                None => (format!("Optional[{}]", &type_name), "None"),
+            let type_name = py_type_from_maya(&flag.type_name, false);
+            let (type_name, default_value): (String, Option<String>) = if flag.required {
+                (type_name, None)
+            } else {
+                match default_value_for_type(&type_name) {
+                    Some(default_value) => (type_name.clone(), Some(default_value.to_string())), // FIXME: Clone should be unnecessary here.
+                    None => (
+                        format!("Optional[{}]", &type_name),
+                        Some("None".to_string()),
+                    ),
+                }
             };
             let mut name = match name_type {
                 FlagNameType::Long => &flag.longname,
@@ -491,7 +520,7 @@ fn py_params_from_maya(
             PyParamDef {
                 name: name.to_string(),
                 type_name,
-                default_value: Some(default_value.to_string()),
+                default_value: default_value,
                 description: flag.description.clone(),
                 variadic: false,
             }
@@ -501,7 +530,7 @@ fn py_params_from_maya(
     let mut args: Vec<PyParamDef> = params
         .iter()
         .map(|param| {
-            let type_name = py_type_from_maya(&param.type_name);
+            let type_name = py_type_from_maya(&param.type_name, false);
             let (type_name, default_value) = if param.mode == ParamMode::Optional {
                 match default_value_for_type(&type_name) {
                     Some(default_value) => (type_name.clone(), Some(default_value.to_string())), // FIXME: Clone should be unnecessary here.
@@ -595,7 +624,7 @@ fn fmt_return_type(return_types: &Vec<ReturnType>) -> String {
     } else {
         return_types
             .iter()
-            .map(|t| py_type_from_maya(&t.name))
+            .map(|t| py_type_from_maya(&t.name, true))
             .unique()
             .join(" | ")
     }
@@ -609,6 +638,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             modes: vec![],
             type_name: String::from("boolean"),
             description: String::from("Enable Edit mode"),
+            required: true
         };
         static ref FLAG_QUERY: MayaFlagDef = MayaFlagDef {
             shortname: String::from("q"),
@@ -616,6 +646,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             modes: vec![],
             type_name: String::from("boolean"),
             description: String::from("Enable Query mode"),
+            required: true
         };
     }
 
@@ -716,6 +747,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                     DescriptionLevel::All | DescriptionLevel::Long => flag.description.clone(),
                     _ => String::new(),
                 },
+                required: true,
             };
 
             // The flags for this will be a required flag for the 'query switch', plus all the other unknown query flags
@@ -727,10 +759,12 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             // does not return a boolean.  We attempt to deduce its return
             // type from its name.  The return type is sometimes described
             // In the description - but that would be hard to parse.
-            let return_type: String = match flag.type_name.as_str() {
-                "boolean" => String::from(py_type_from_flag_name(&flag.longname).unwrap_or("Any")),
-                _ => py_type_from_maya(&flag.type_name),
-            };
+            // let return_type: String = match flag.type_name.as_str() {
+            //     "boolean" => String::from(py_type_from_flag_name(&flag.longname).unwrap_or("Any")),
+            //     _ => py_type_from_maya(&flag.type_name),
+            // };
+
+            let return_type = py_type_from_maya(&flag.type_name, true);
 
             defs.extend(
                 double_defs(
@@ -875,17 +909,22 @@ fn apply_func_fixes(mut def: MayaFuncDef) -> MayaFuncDef {
     // This is just a test of a possible pipeline, which would load
     // Fixes to the documentation from an external file.
     if def.name == "file" {
+        // In the 'file' documentation, many flags are listed as only available in 'query', but they are available in 'create' too.
         def.params = vec![MayaParamDef {
             type_name: "filename".to_string(),
             mode: ParamMode::Default,
         }];
 
-        let namespace_flag = def
+        let flags_to_fix = ["namespace", "reference"];
+
+        let flags: Vec<&mut MayaFlagDef> = def
             .flags
             .iter_mut()
-            .find(|flag| ["namespace", "reference"].contains(&flag.longname.as_str()))
-            .unwrap();
-        namespace_flag.modes = vec![FlagMode::Query, FlagMode::Create];
+            .filter(|flag| flags_to_fix.contains(&flag.longname.as_str()))
+            .collect();
+        for flag in flags {
+            flag.modes = vec![FlagMode::Create, FlagMode::Query];
+        }
     }
     def
 }
@@ -920,11 +959,13 @@ fn add_missing_funcs() -> Vec<MayaFuncDef> {
     f.add_flag("syncOutputs", "so", "boolean", vec![]);
     f.add_flag("syncTemplatedGeos", "stm", "boolean", vec![]);
     f.add_flag("syncName", "syn", "boolean", vec![]);
+    f.set_return_type("string");
     defs.push(f);
 
     let mut f = MayaFuncDef::new("invertShape");
     f.add_param("string", ParamMode::Default);
     f.add_param("string", ParamMode::Default);
+    f.set_return_type("string");
     defs.push(f);
 
     defs
@@ -956,7 +997,7 @@ fn main() -> std::io::Result<()> {
     let mut file = File::create(output_filepath)?;
     writeln!(
         file,
-        "from typing import Any, Text, Tuple, overload, Optional"
+        "from typing import Any, Text, Tuple, overload, Optional, Literal"
     )?;
     for python_def in parse_all_maya_docs("./source_docs/2023/CommandsPython") {
         writeln!(file, "{}", python_def)?;
@@ -1108,6 +1149,30 @@ mod tests {
             result.return_type[1].description,
             "When asking for a plug name."
         );
+        fmt_func_pys(&result);
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_file() {
+        let filepath = "./source_docs/2023/CommandsPython/file.html";
+        let result = parse_maya_function_doc(&filepath).unwrap();
+        let result = apply_func_fixes(result);
+        assert_eq!(result.name, "file");
+        let flag = result
+            .flags
+            .iter()
+            .find(|flag| flag.longname == "reference")
+            .unwrap();
+        assert_eq!(flag.modes, vec![FlagMode::Create, FlagMode::Query]);
+        assert_eq!(flag.type_name, "boolean");
+        let flag = result
+            .flags
+            .iter()
+            .find(|flag| flag.longname == "namespace")
+            .unwrap();
+        assert_eq!(flag.modes, vec![FlagMode::Create, FlagMode::Query]);
+        assert_eq!(flag.type_name, "string");
         fmt_func_pys(&result);
     }
 }
