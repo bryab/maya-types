@@ -159,7 +159,7 @@ fn default_value_for_type(pytype: &str) -> Option<&str> {
     let value_str = match pytype {
         "int" => "0",
         "float" => "0.0",
-        "Text" => "\"\"",
+        "Text" | "TextArg" => "\"\"",
         "bool" => "False",
         _ => return None,
     };
@@ -504,7 +504,8 @@ fn py_params_from_maya(
             }
             param_names.borrow_mut().insert(name.clone());
 
-            let type_name = if flag.modes.contains(&FlagMode::Multiuse) {
+            // NB: If type is already 'TextArg', then that is handling the multi-use flag.
+            let type_name = if &type_name != "TextArg" && flag.modes.contains(&FlagMode::Multiuse) {
                 format!("{0} | list[{0}] | Tuple[{0},...]", &type_name)
             } else {
                 type_name.to_string()
