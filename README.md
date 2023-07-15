@@ -3,6 +3,7 @@ Written in Rust, because why not. It's fun.
 
 # Just give me the types
 
+Below is a minimal file without any docstrings. To generate one that includes docstrings, follow the guide below.
 [maya.cmds typings for Maya 2023](./typings/maya/cmds/__init__.pyi)
 
 # Usage
