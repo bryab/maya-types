@@ -789,7 +789,10 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             &def.name,
             &py_params_from_maya(&def.params, &vec![], FlagNameType::Long),
             &return_type,
-            &def.description,
+            match desclevel {
+                DescriptionLevel::None => "",
+                _ => &def.description,
+            },
         ));
     }
 
