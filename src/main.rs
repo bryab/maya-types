@@ -39,7 +39,7 @@ enum DescriptionLevel {
     /// Write docstrings for all functions
     All,
 }
-static CONFIG: Lazy<Mutex<Cli>> = Lazy::new(|| Mutex::new(Cli::parse()));
+static CONFIG: Lazy<Cli> = Lazy::new(|| Cli::parse());
 
 #[derive(Debug, PartialEq)]
 enum FlagMode {
@@ -584,9 +584,8 @@ fn double_defs(
     return_type: &str,
     description: &str,
 ) -> Vec<String> {
-    let config = CONFIG.lock().unwrap();
-    let desclevel = config.desclevel;
-    let do_short = config.short;
+    let desclevel = CONFIG.desclevel;
+    let do_short = CONFIG.short;
     let mut defs = vec![fmt_py_def(
         &name,
         &py_params_from_maya(&params, &flags, FlagNameType::Long),
@@ -645,7 +644,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         };
     }
 
-    let desclevel = CONFIG.lock().unwrap().desclevel;
+    let desclevel = CONFIG.desclevel;
 
     let create_flags: Vec<&MayaFlagDef> = def
         .flags
