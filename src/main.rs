@@ -112,15 +112,7 @@ fn py_type_from_maya_simple(type_name: &str, is_return_type: bool) -> &str {
     }
     match type_name.to_lowercase().as_str() {
         "int" | "int64" | "uint" => "int",
-        "boolean" => {
-            // It seems that for flags and parameters, any boolean parameter accepts, at least, a boolean or 0/1 integer.
-            // However, if this is a return type, we don't want to return a union, as this adds ambiguity and makes Pylance very sad.
-            if is_return_type {
-                "bool"
-            } else {
-                "bool | Literal[0,1]"
-            }
-        }
+        "boolean" => "bool", // Note that boolean parameters usually accepts 0 or 1 as well, but making this a Union puts unnecessary strain on Pylance
         "float" | "angle" | "double" | "time" | "linear" => "float",
         "floatrange" => "Tuple[float,float]",
         "timerange" => "Tuple[float,float]",
@@ -135,7 +127,7 @@ fn py_type_from_maya_simple(type_name: &str, is_return_type: bool) -> &str {
             if is_return_type {
                 "Text"
             } else {
-                "Text | list[Text] | Tuple[Text, ...]"
+                "TextArg"
             }
         }
         _ => {
@@ -391,7 +383,7 @@ fn fmt_func_py(def: MayaFuncDef) -> String {
     if defs.is_empty() {
         panic!("No function defs produced for {:?}!", &def)
     } else if defs.len() == 1 {
-        defs[0].clone() // FIXME: Surely I can move this String out somehow?
+        defs.into_iter().next().unwrap()
     } else {
         format!("@overload\n{0}", defs.join("\n@overload\n"))
     }
@@ -618,6 +610,8 @@ fn double_defs(
     defs
 }
 
+// There is an ambiguity in functions that have multiple return types.
+// Usually, there is one return type when not in query mode, and the query mode return types have the word "query" in the description
 fn fmt_return_type(return_types: &Vec<ReturnType>) -> String {
     if return_types.is_empty() {
         String::from("None")
@@ -663,6 +657,12 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         .collect();
 
     let mut defs: Vec<String> = vec![];
+
+    let return_types = &def.return_type;
+
+    if return_types.len() > 1 {
+        println!("{}", def.name);
+    }
 
     if !create_flags.is_empty() {
         let return_type = fmt_return_type(&def.return_type);
@@ -730,7 +730,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             &def.name,
             &def.params,
             &flags,
-            return_type,
+            &return_type,
             match desclevel {
                 DescriptionLevel::All | DescriptionLevel::Long => &def.description,
                 _ => "",
@@ -997,7 +997,7 @@ fn main() -> std::io::Result<()> {
     let mut file = File::create(output_filepath)?;
     writeln!(
         file,
-        "from typing import Any, Text, Tuple, overload, Optional, Literal"
+        "from typing import Any, Text, Tuple, overload, Optional, Literal\nTextArg = Text | list[Text] | Tuple[Text, ...]"
     )?;
     for python_def in parse_all_maya_docs("./source_docs/2023/CommandsPython") {
         writeln!(file, "{}", python_def)?;
