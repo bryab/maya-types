@@ -12,7 +12,6 @@ use std::io::prelude::Write;
 use std::iter;
 use std::path::Path;
 use std::path::PathBuf;
-use std::{collections::HashMap, sync::Mutex};
 
 use clap::{Parser, ValueEnum};
 
@@ -20,16 +19,22 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Amount of docstrings generation
-    #[arg(default_value_t= DescriptionLevel::All)]
+    /// Source 'CommandsPython' directory containing html files
+    #[arg(default_value = "./source_docs/2023/CommandsPython")]
+    source: String,
+    /// Output .pyi file
+    #[arg(default_value = "./output/maya/cmds/__init__.pyi")]
+    output: String,
+    /// Amount of docstrings generation - Reducing docstrings can help Pylance performance
+    #[arg(default_value_t= DocstringLevel::All)]
     #[arg(short, long, value_enum)]
-    desclevel: DescriptionLevel,
-    /// Include short-form flag overloads of all functions
+    doclevel: DocstringLevel,
+    /// Include short-form flag overloads of all functions.  Only longform syntax is supported by default for performance reasons.
     #[arg(short, long, default_value_t = false)]
     short: bool,
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum DescriptionLevel {
+enum DocstringLevel {
     /// Do not write any docstrings at all
     None,
     /// Only write docstrings for "create" mode with longform flags
@@ -136,17 +141,6 @@ fn py_type_from_maya_simple(type_name: &str, is_return_type: bool) -> &str {
         }
     }
 }
-
-/// Some query flags don't specify the return type in a way that is easy to parse.
-/// Here I attempt to deduce the type from the name of the parameter.
-// This is rather questionable - it probably would take a great bit of work to add all the necessary values here.
-// fn py_type_from_flag_name(name: &str) -> Option<&str> {
-//     let type_name = match name {
-//         "boundingBox" => "Tuple[float,float,float,float,float,float]",
-//         _ => return None,
-//     };
-//     Some(type_name)
-// }
 
 /// In order to handle optional flags in functions, we must provide the default value for each flag.
 /// Unfortunately this is not known from the documentation.  The standard procedure here in Python
@@ -577,21 +571,21 @@ fn py_params_from_maya(
     args
 }
 
-fn double_defs(
+fn fmt_py_long_and_short(
     name: &str,
     params: &Vec<MayaParamDef>,
     flags: &Vec<&MayaFlagDef>,
     return_type: &str,
     description: &str,
 ) -> Vec<String> {
-    let desclevel = CONFIG.desclevel;
+    let desclevel = CONFIG.doclevel;
     let do_short = CONFIG.short;
     let mut defs = vec![fmt_py_def(
         &name,
         &py_params_from_maya(&params, &flags, FlagNameType::Long),
         &return_type,
         match desclevel {
-            DescriptionLevel::None => "",
+            DocstringLevel::None => "",
             _ => &description,
         },
     )];
@@ -602,7 +596,7 @@ fn double_defs(
             &py_params_from_maya(&params, &flags, FlagNameType::Short),
             &return_type,
             match desclevel {
-                DescriptionLevel::All => &description,
+                DocstringLevel::All => &description,
                 _ => "",
             },
         ));
@@ -644,7 +638,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         };
     }
 
-    let desclevel = CONFIG.desclevel;
+    let desclevel = CONFIG.doclevel;
 
     let create_flags: Vec<&MayaFlagDef> = def
         .flags
@@ -658,17 +652,17 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
 
     let mut defs: Vec<String> = vec![];
 
-    let return_types = &def.return_type;
+    //let return_types = &def.return_type;
 
-    if return_types.len() > 1 {
-        println!("{}", def.name);
-    }
+    // if return_types.len() > 1 {
+    //     println!("{}", def.name);
+    // }
 
     if !create_flags.is_empty() {
         let return_type = fmt_return_type(&def.return_type);
 
         defs.extend(
-            double_defs(
+            fmt_py_long_and_short(
                 &def.name,
                 &def.params,
                 &create_flags,
@@ -691,13 +685,13 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         edit_flags.insert(0, &FLAG_EDIT);
 
         defs.extend(
-            double_defs(
+            fmt_py_long_and_short(
                 &def.name,
                 &def.params,
                 &edit_flags,
                 &return_type,
                 match desclevel {
-                    DescriptionLevel::All => &def.description,
+                    DocstringLevel::All => &def.description,
                     _ => "",
                 },
             )
@@ -726,13 +720,13 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
         let mut flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY];
         flags.extend(&query_flags);
 
-        defs.extend(double_defs(
+        defs.extend(fmt_py_long_and_short(
             &def.name,
             &def.params,
             &flags,
             &return_type,
             match desclevel {
-                DescriptionLevel::All | DescriptionLevel::Long => &def.description,
+                DocstringLevel::All | DocstringLevel::Long => &def.description,
                 _ => "",
             },
         ));
@@ -744,7 +738,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
                 type_name: String::from("boolean"),
                 modes: vec![],
                 description: match desclevel {
-                    DescriptionLevel::All | DescriptionLevel::Long => flag.description.clone(),
+                    DocstringLevel::All | DocstringLevel::Long => flag.description.clone(),
                     _ => String::new(),
                 },
                 required: true,
@@ -754,26 +748,16 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             let mut flags: Vec<&MayaFlagDef> = vec![&FLAG_QUERY, &new_flag];
             flags.extend(&query_flags);
 
-            // This is very hacky - just an experiment.
-            // If a query flag is described as a boolean, then it probably
-            // does not return a boolean.  We attempt to deduce its return
-            // type from its name.  The return type is sometimes described
-            // In the description - but that would be hard to parse.
-            // let return_type: String = match flag.type_name.as_str() {
-            //     "boolean" => String::from(py_type_from_flag_name(&flag.longname).unwrap_or("Any")),
-            //     _ => py_type_from_maya(&flag.type_name),
-            // };
-
             let return_type = py_type_from_maya(&flag.type_name, true);
 
             defs.extend(
-                double_defs(
+                fmt_py_long_and_short(
                     &def.name,
                     &def.params,
                     &flags,
                     &return_type,
                     match desclevel {
-                        DescriptionLevel::All | DescriptionLevel::Long => &flag.description,
+                        DocstringLevel::All | DocstringLevel::Long => &flag.description,
                         _ => "",
                     },
                 )
@@ -790,7 +774,7 @@ fn fmt_func_pys(def: &MayaFuncDef) -> Vec<String> {
             &py_params_from_maya(&def.params, &vec![], FlagNameType::Long),
             &return_type,
             match desclevel {
-                DescriptionLevel::None => "",
+                DocstringLevel::None => "",
                 _ => &def.description,
             },
         ));
@@ -996,13 +980,17 @@ fn parse_all_maya_docs<P: AsRef<Path>>(dirpath: P) -> Vec<String> {
 }
 
 fn main() -> std::io::Result<()> {
-    let output_filepath = "./typings/maya/cmds/__init__.pyi";
-    let mut file = File::create(output_filepath)?;
+    let output_filepath = Path::new(&CONFIG.output);
+    let output_parent = output_filepath.parent().expect("Invalid path");
+    if !output_parent.exists() {
+        fs::create_dir_all(output_parent)?;
+    }
+    let mut file = File::create(&output_filepath)?;
     writeln!(
         file,
         "from typing import Any, Text, Tuple, overload, Optional, Literal\nTextArg = Text | list[Text] | Tuple[Text, ...]"
     )?;
-    for python_def in parse_all_maya_docs("./source_docs/2023/CommandsPython") {
+    for python_def in parse_all_maya_docs(&CONFIG.source) {
         writeln!(file, "{}", python_def)?;
     }
     Ok(())
